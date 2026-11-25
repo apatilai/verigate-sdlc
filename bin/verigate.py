@@ -61,7 +61,7 @@ PROTECTED_LEDGER_RE = re.compile(
     re.IGNORECASE,
 )
 GOVERNANCE_RE = re.compile(
-    r"(^|/)(REVIEW\.md|\.sdlc/(REVIEW\.md|config\.json|policy\.json)|\.claude/settings.*\.json|\.agents/hooks\.json|\.gemini/settings\.json|\.githooks/[^/]+|\.github/workflows/[^/]+\.ya?ml|azure-pipelines.*\.ya?ml)$",
+    r"(^|/)(REVIEW\.md|\.sdlc/(REVIEW\.md|config\.json|policy\.json|active-change)|\.claude/settings.*\.json|\.agents/hooks\.json|\.gemini/settings\.json|\.githooks/[^/]+|\.github/workflows/[^/]+\.ya?ml|azure-pipelines.*\.ya?ml)$",
     re.IGNORECASE,
 )
 SANCTIONED_GATE_CMD_RE = re.compile(
@@ -77,7 +77,7 @@ SHELL_SECRET_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 LEDGER_TAMPER_CMD_RE = re.compile(
-    r"(\.sdlc[/\\](?:changes[/\\][^/\\\s]+[/\\])?(approvals|waivers|audit|bin|config\.json)|\.claude[/\\]settings|\.agents[/\\]hooks\.json|\.githooks|shadow_ledger\.json|verigate-shadow)",
+    r"(\.sdlc[/\\](?:changes[/\\][^/\\\s]+[/\\])?(approvals|waivers|audit|bin|config\.json|active-change)|\.claude[/\\]settings|\.agents[/\\]hooks\.json|\.githooks|shadow_ledger\.json|verigate-shadow)",
     re.IGNORECASE,
 )
 EXTERNAL_MUTATION_CMD_RE = re.compile(
@@ -88,23 +88,32 @@ EXTERNAL_MUTATION_CMD_RE = re.compile(
     r"issue_bridge\.py\s+create)\b",
     re.IGNORECASE,
 )
-TEST_RUNNER_CMD_RE = re.compile(
-    r"\b(pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|vitest|jest|"
-    r"cargo\s+test|go\s+test|mvn\s+test|gradle\s+test|dotnet\s+test|"
-    r"ruff\s+check|flake8|mypy|pyright|tsc|eslint|"
-    r"terraform\s+(?:validate|fmt\s+-check|test)|tflint|checkov|tfsec|"
-    r"conftest\s+test|opa\s+(?:test|eval))\b",
+ERROR_SWALLOW_RE = re.compile(
+    r"(?:\|\|\s*(?:true\b|exit\s+0\b|:(?=\s|$|[;&|\n]))|;\s*(?:true|exit\s+0|:)\s*$)",
     re.IGNORECASE,
 )
-ECHO_OR_PRINT_PREFIX_RE = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*(?:echo|printf|Write-Host|Write-Output)\b",
-    re.IGNORECASE,
-)
+UNQUOTED_REDIRECT_RE = re.compile(r"(?<!>)(?:[012&])?>>?\s*(?!&)")
+SINGLE_TOKEN_TEST_RUNNERS = {
+    "pytest",
+    "vitest",
+    "jest",
+    "flake8",
+    "mypy",
+    "pyright",
+    "tsc",
+    "eslint",
+    "tflint",
+    "checkov",
+    "tfsec",
+}
+PYTHON_PROGS_RE = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|py)$")
+PYTHON_TEST_MODULES = {"pytest", "unittest", "mypy", "flake8", "pyright", "checkov"}
 PS_WRITE_CMDLET_RE = re.compile(
     r"\b(Set-Content|Add-Content|Out-File|Copy-Item|Move-Item)\b",
     re.IGNORECASE,
 )
 CHANGE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+BRANCH_TICKET_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,10}-\d+)(?![A-Za-z0-9])")
 
 PROJECT_MARKERS = (".sdlc", ".git", "package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml")
 META_DIR_RE = re.compile(r"(^|/)(\.sdlc|\.claude|\.agents|\.cursor|\.githooks|\.codex)(/|$)")
@@ -261,6 +270,28 @@ def sanitize_change_id(raw: str | None, strict: bool = True) -> str | None:
     return val
 
 
+def _branch_ticket_id(project_root: str) -> str | None:
+    root = os.path.realpath(project_root)
+    branch = ""
+    for git_args in (
+        ["git", "-C", root, "symbolic-ref", "--short", "HEAD"],
+        ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+    ):
+        try:
+            proc = subprocess.run(git_args, capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0 and proc.stdout.strip():
+                branch = proc.stdout.strip()
+                break
+        except Exception:
+            continue
+    if not branch or branch in ("main", "master", "HEAD"):
+        return None
+    m = BRANCH_TICKET_RE.search(branch)
+    if m:
+        return sanitize_change_id(m.group(1), strict=False)
+    return None
+
+
 def resolve_change_id(project_root: str, explicit_change: str | None = None, strict: bool = False) -> str | None:
     if explicit_change is not None and explicit_change.strip():
         return sanitize_change_id(explicit_change, strict=True)
@@ -276,7 +307,7 @@ def resolve_change_id(project_root: str, explicit_change: str | None = None, str
                     return sanitize_change_id(line, strict=False)
         except OSError:
             pass
-    return None
+    return _branch_ticket_id(project_root)
 
 
 def resolve_artifact_dir(project_root: str, change_id: str | None = None, strict: bool = False) -> tuple[str, str, str | None]:
@@ -459,16 +490,223 @@ def is_spec_lock_active(proj_root: str, session: dict, change_id: str | None = N
     )
 
 
+def _strip_quoted_strings(cmd: str) -> str:
+    """Replace single- and double-quoted string contents with empty quotes ('' / \"\")."""
+    out: list[str] = []
+    i = 0
+    n = len(cmd)
+    quote: str | None = None
+    while i < n:
+        ch = cmd[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                out.append("'")
+                quote = None
+            i += 1
+        else:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                out.append('"')
+                quote = None
+            i += 1
+    if quote is not None:
+        out.append(quote)
+    return "".join(out)
+
+
+def _split_shell_segments(cmd: str) -> list[str]:
+    """Split shell/PowerShell command on unquoted &&, ||, ;, |, or newlines."""
+    segments: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(cmd)
+    quote: str | None = None
+    while i < n:
+        ch = cmd[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+                i += 1
+                continue
+            if ch in (";", "\n"):
+                seg = "".join(buf).strip()
+                if seg:
+                    segments.append(seg)
+                buf = []
+                i += 1
+                continue
+            if ch == "&" and i + 1 < n and cmd[i + 1] == "&":
+                seg = "".join(buf).strip()
+                if seg:
+                    segments.append(seg)
+                buf = []
+                i += 2
+                continue
+            if ch == "|":
+                seg = "".join(buf).strip()
+                if seg:
+                    segments.append(seg)
+                buf = []
+                i += 2 if (i + 1 < n and cmd[i + 1] == "|") else 1
+                continue
+            buf.append(ch)
+            i += 1
+        elif quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                quote = None
+            i += 1
+        else:
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            buf.append(ch)
+            if ch == '"':
+                quote = None
+            i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _normalize_prog_name(tok: str) -> str:
+    name = os.path.basename(tok.replace("\\", "/")).lower()
+    for ext in (".exe", ".cmd", ".bat", ".ps1"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name
+
+
+def _segment_is_test_runner(seg: str) -> bool:
+    toks = [_strip_quotes(t) for t in _safe_split(seg, posix=False)]
+    while toks:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks.pop(0)
+            continue
+        prog = _normalize_prog_name(toks[0])
+        if prog == "env":
+            toks.pop(0)
+            while toks:
+                if toks[0] in ("-u", "--unset", "-C", "--chdir") and len(toks) >= 2:
+                    toks = toks[2:]
+                elif toks[0].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+                    toks.pop(0)
+                else:
+                    break
+            continue
+        if prog in ("uv", "poetry") and len(toks) >= 2 and toks[1].lower() == "run":
+            toks = toks[2:]
+            while toks and toks[0].startswith("-"):
+                toks.pop(0)
+            continue
+        if prog in ("npx", "bunx"):
+            toks.pop(0)
+            while toks and toks[0].startswith("-"):
+                toks.pop(0)
+            continue
+        if prog in ("pnpm", "yarn") and len(toks) >= 2 and toks[1].lower() == "exec":
+            toks = toks[2:]
+            while toks and toks[0].startswith("-"):
+                toks.pop(0)
+            continue
+        break
+
+    if not toks:
+        return False
+
+    prog = _normalize_prog_name(toks[0])
+    args = [a.lower() for a in toks[1:]]
+
+    if PYTHON_PROGS_RE.match(prog):
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "-m":
+                if i + 1 < len(args):
+                    mod = args[i + 1]
+                    rest = args[i + 2 :]
+                    if mod in PYTHON_TEST_MODULES:
+                        return True
+                    if mod == "ruff" and rest and rest[0] == "check":
+                        return True
+                return False
+            if a in ("-c", "-"):
+                return False
+            if a.startswith("-"):
+                if a in ("-w", "-x") and i + 1 < len(args):
+                    i += 2
+                else:
+                    i += 1
+                continue
+            return False
+        return False
+
+    if prog in SINGLE_TOKEN_TEST_RUNNERS:
+        return True
+
+    if prog in ("npm", "pnpm", "yarn", "bun"):
+        if not args:
+            return False
+        if args[0] == "test" or (args[0] == "run" and len(args) >= 2 and args[1] == "test"):
+            return True
+        if prog in ("pnpm", "yarn", "bun") and args[0] in SINGLE_TOKEN_TEST_RUNNERS:
+            return True
+        return False
+
+    if prog in ("cargo", "go", "mvn", "mvnw", "gradle", "gradlew", "dotnet", "conftest"):
+        return bool(args and args[0] == "test")
+
+    if prog == "ruff":
+        return bool(args and args[0] == "check")
+
+    if prog == "terraform":
+        if not args:
+            return False
+        if args[0] in ("validate", "test"):
+            return True
+        if args[0] == "fmt":
+            return any(a in ("-check", "-check=true") for a in args[1:])
+        return False
+
+    if prog == "opa":
+        return bool(args and args[0] in ("test", "eval"))
+
+    return False
+
+
 def is_real_test_runner_command(cmd: str) -> bool:
     if not cmd or not cmd.strip():
         return False
-    for segment in re.split(r"(?:&&|\|\||[;|\n])", cmd):
-        part = segment.strip()
-        if not part:
-            continue
-        if ECHO_OR_PRINT_PREFIX_RE.match(part):
-            continue
-        if TEST_RUNNER_CMD_RE.search(part):
+    unquoted = _strip_quoted_strings(cmd)
+    if ERROR_SWALLOW_RE.search(unquoted):
+        return False
+    for segment in _split_shell_segments(cmd):
+        if _segment_is_test_runner(segment):
             return True
     return False
 
@@ -486,6 +724,80 @@ def _safe_split(seg: str, posix: bool = True) -> list[str]:
         return seg.split()
 
 
+def _extract_redirection_targets(seg: str) -> list[str]:
+    """Extract target filenames following unquoted shell redirections (> / >>), excluding >& redirects."""
+    targets: list[str] = []
+    i = 0
+    n = len(seg)
+    quote: str | None = None
+    while i < n:
+        ch = seg[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if ch == ">":
+                prev = seg[i - 1] if i > 0 else ""
+                if prev == ">":
+                    i += 1
+                    continue
+                j = i + 1
+                if j < n and seg[j] == ">":
+                    j += 1
+                while j < n and seg[j].isspace():
+                    j += 1
+                if j < n and seg[j] == "&":
+                    i = j + 1
+                    continue
+                if j < n:
+                    if seg[j] in ("'", '"'):
+                        q = seg[j]
+                        k = j + 1
+                        buf: list[str] = []
+                        while k < n:
+                            if q == '"' and seg[k] == "\\" and k + 1 < n:
+                                buf.append(seg[k + 1])
+                                k += 2
+                                continue
+                            if seg[k] == q:
+                                k += 1
+                                break
+                            buf.append(seg[k])
+                            k += 1
+                        t = "".join(buf).strip()
+                        if t:
+                            targets.append(t)
+                        i = k
+                        continue
+                    k = j
+                    while k < n and not seg[k].isspace() and seg[k] not in ";|&><'\"":
+                        k += 1
+                    t = seg[j:k].strip()
+                    if t:
+                        targets.append(t)
+                    i = k
+                    continue
+                i = j
+                continue
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+        else:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            i += 1
+    return targets
+
+
 def extract_shell_write_targets(cmd: str) -> tuple[bool, list[str]]:
     """Detect shell/PowerShell file writes and extract target path(s)."""
     if not cmd or not cmd.strip():
@@ -494,20 +806,20 @@ def extract_shell_write_targets(cmd: str) -> tuple[bool, list[str]]:
     targets: list[str] = []
     null_targets = {"/dev/null", "nul", "$null", "/dev/stdout", "/dev/stderr"}
 
-    for segment in re.split(r"(?:&&|\|\||[;|\n])", cmd):
-        seg = segment.strip()
+    for seg in _split_shell_segments(cmd):
         if not seg:
             continue
+        unquoted_seg = _strip_quoted_strings(seg)
 
-        # 1. Shell redirections (> / >>), excluding >& redirects and null sinks
-        for m in re.finditer(r"(?<![>&])(?:[012])?>>?\s*(?!&)(?:[\"']([^\"']+)[\"']|([^\s;|&><'\"]+))", seg):
-            target = (m.group(1) or m.group(2) or "").strip()
-            if target and target.lower() not in null_targets:
-                is_write = True
-                targets.append(target)
+        # 1. Unquoted shell redirections (> / >>), excluding >& redirects and null sinks
+        if UNQUOTED_REDIRECT_RE.search(unquoted_seg):
+            for target in _extract_redirection_targets(seg):
+                if target and target.lower() not in null_targets:
+                    is_write = True
+                    targets.append(target)
 
         # 2. Inline Python open(..., 'w'/'a')
-        if re.search(r"\bpython(?:3)?\b.*\bopen\s*\([^)]*['\"][wa]", seg, re.IGNORECASE):
+        if re.search(r"\b(?:python(?:3(?:\.\d+)?)?|py)\b.*\bopen\s*\([^)]*['\"][wa]", seg, re.IGNORECASE):
             is_write = True
             for m in re.finditer(
                 r"\bopen\s*\(\s*r?[\"']([^\"']+)[\"']\s*,\s*(?:mode\s*=\s*)?[\"'][wa]",
@@ -517,7 +829,7 @@ def extract_shell_write_targets(cmd: str) -> tuple[bool, list[str]]:
                 targets.append(m.group(1))
 
         # 3. PowerShell write cmdlets (Set-Content, Add-Content, Out-File, Copy-Item, Move-Item)
-        ps_m = PS_WRITE_CMDLET_RE.search(seg)
+        ps_m = PS_WRITE_CMDLET_RE.search(unquoted_seg)
         if ps_m:
             is_write = True
             cmdlet = ps_m.group(1).lower()
@@ -729,7 +1041,10 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
     sdlc.mkdir(parents=True, exist_ok=True)
     cfg = sdlc / "config.json"
     if not cfg.exists():
-        cfg.write_text(json.dumps({"require_spec_approval": require_spec, "version": "2.4.0"}, indent=2) + "\n", encoding="utf-8")
+        cfg.write_text(
+            json.dumps({"require_spec_approval": require_spec, "version": "2.4.0", "terraform_dirs": []}, indent=2) + "\n",
+            encoding="utf-8",
+        )
     policy = sdlc / "policy.json"
     if not policy.exists():
         policy.write_text(
@@ -770,7 +1085,7 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
 
 
 def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
-    """Deterministic Team Policy Approval Gate: Review (0 open findings) + Spec SHA-256 -> Ready to Merge."""
+    """Deterministic Consistency & Policy Check: Review (0 open findings) + Spec SHA-256 digest consistency -> Ready to Merge."""
     sdlc = Path(project_root) / ".sdlc"
     art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
     art_dir = Path(art_dir_str)
@@ -844,6 +1159,7 @@ def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
         "open_findings": open_count,
         "policy": policy,
         "blocking_reasons": reasons,
+        "note": "Consistency and policy check (verifies artifact SHA-256 digest consistency and review policy; not cryptographic proof of human identity).",
     }
     if cid:
         out["change_id"] = cid
@@ -938,6 +1254,60 @@ def cmd_waive(project_root: str, stage: str, reason: str, change_id: str | None 
 # --- Multi-Harness Hook Protocol Adapter ---
 
 
+def _response_indicates_failure(tresp: object) -> bool:
+    """Detect non-zero exit codes or errors in dict or string tool_response payloads."""
+    if isinstance(tresp, dict):
+        for key in ("exit_code", "exitCode", "code", "returncode"):
+            val = tresp.get(key)
+            if val is not None:
+                try:
+                    if int(val) != 0:
+                        return True
+                except (TypeError, ValueError):
+                    return True
+        if tresp.get("interrupted") or tresp.get("is_error") or tresp.get("isError"):
+            return True
+        return False
+    if isinstance(tresp, str):
+        if re.search(r"\b(?:Exit code|Command exited with code)\s+[1-9]\d*\b", tresp, re.IGNORECASE):
+            return True
+    return False
+
+
+def _log_hook_debug(adapter: str, event: str, payload: dict) -> None:
+    if os.environ.get("VERIGATE_DEBUG_HOOK") != "1":
+        return
+    try:
+        tname = payload.get("tool_name") or (payload.get("toolCall") or {}).get("name") or ""
+        if "tool_response" in payload:
+            tresp = payload.get("tool_response")
+        elif "toolResponse" in payload:
+            tresp = payload.get("toolResponse")
+        else:
+            tresp = payload.get("result")
+        if isinstance(tresp, dict):
+            resp_keys = sorted(str(k) for k in tresp.keys())
+            resp_type = "dict"
+        elif tresp is None:
+            resp_keys = []
+            resp_type = "none"
+        else:
+            resp_keys = []
+            resp_type = type(tresp).__name__
+        rec = {
+            "timestamp": utc_now_iso(),
+            "adapter": adapter,
+            "event": event,
+            "tool_name": str(tname),
+            "tool_response_type": resp_type,
+            "tool_response_keys": resp_keys,
+        }
+        with open(os.path.join(global_state_dir(), "hook_debug.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
 def handle_hook(adapter: str, event_override: str | None, change_id: str | None = None) -> int:
     if adapter == "git-pre-commit":
         proj = resolve_project_root(".", os.getcwd())
@@ -969,6 +1339,7 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
     session_id = str(payload.get("conversationId") or payload.get("session_id") or "default")
     cwd = payload.get("cwd") or os.getcwd()
     event = event_override or payload.get("hookEventName") or payload.get("hook_event_name") or ""
+    _log_hook_debug(adapter, event, payload)
     session = load_session(session_id)
 
     if event in ("PreInvocation", "UserPromptSubmit"):
@@ -1055,13 +1426,9 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
         if adapter == "claude":
             tname = payload.get("tool_name") or ""
             tinput = payload.get("tool_input") or {}
-            tresp = payload.get("tool_response") or {}
-            if isinstance(tresp, dict):
-                ec = tresp.get("exit_code")
-                if ec is None:
-                    ec = tresp.get("exitCode")
-                if ec not in (None, 0) or tresp.get("is_error") or tresp.get("isError"):
-                    cmd_failed = True
+            tresp = payload.get("tool_response")
+            if _response_indicates_failure(tresp):
+                cmd_failed = True
             path = (
                 str(tinput.get("file_path") or tinput.get("notebook_path") or "")
                 if tname in ("Write", "Edit", "MultiEdit", "NotebookEdit")
@@ -1075,13 +1442,9 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
                 else ""
             )
         else:
-            tresp = payload.get("toolResponse") or payload.get("result") or {}
-            if isinstance(tresp, dict):
-                ec = tresp.get("exit_code")
-                if ec is None:
-                    ec = tresp.get("exitCode")
-                if ec not in (None, 0):
-                    cmd_failed = True
+            tresp = payload.get("toolResponse") if "toolResponse" in payload else payload.get("result")
+            if _response_indicates_failure(tresp):
+                cmd_failed = True
             if cmd_failed:
                 print("{}")
                 return 0

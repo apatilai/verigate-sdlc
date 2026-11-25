@@ -43,7 +43,7 @@ UNIVERSAL_RULE_BODY = """# Enterprise AI-Native SDLC (Local Agent Guide Rails + 
 This repository uses the **6-Stage VeriGate AI-Native Software Development Lifecycle (AI-SDLC)** combining **local agent guide rails** with **CI/PR policy gates**:
 
 - **Local Agent Guide Rails**: Cooperative lifecycle hooks, SHA-256 content-hash spec tracking, shell/PowerShell write checks, real test/IaC runner exit-code verification, and non-trapping Stop reminders catch honest mistakes early in your local IDE/CLI session.
-- **Hard Enterprise Controls (CI/PR Boundary)**: Local hooks are developer guide rails — NOT a substitute for bank-grade access controls. Hard enforcement remains in **Git branch protection, human PR approvals, and CI/CD policy gates** (`.github/workflows/verigate-gate.yml` / `azure-pipelines.yml`).
+- **Hard Enterprise Controls (CI/PR Boundary)**: Local hooks are developer guide rails — NOT a substitute for bank-grade access controls. CI `verigate.py validate` and `verigate.py merge-check` are **artifact consistency checks** (verifying that specs, SHA-256 hashes, and review files are internally consistent). Real human approval is enforced by **Git branch protection + required CODEOWNERS reviewer on `.sdlc/changes/**`** alongside CI/CD checks (`.github/workflows/verigate-gate.yml` / `azure-pipelines.yml`).
 
 ## 1. Six Stages, Artifacts & Control Layers
 
@@ -54,7 +54,7 @@ This repository uses the **6-Stage VeriGate AI-Native Software Development Lifec
 | **S3: Build** | `verigate-builder` | Modular source / IaC code | Secret files (`.env`, `*.pem`, `*.key`), `.sdlc/bin/*`, and `.sdlc/approvals*` edits blocked by local hooks |
 | **S4: Verify** | `verigate-verifier` | Executed tests/IaC checks or Logged Waiver | Stop / Commit gate requires a real test/IaC command exit code `0` or a `verigate.py waive` audit entry |
 | **S5: Review** | `verigate-reviewer` + `verigate-sentinel` | `review-findings.json` + `review-report.md` | Governed 6-pillar code review against `.sdlc/REVIEW.md` |
-| **S6: Triage** | `issue_bridge.py` + Human | GitHub Issues / Azure DevOps + Fix | Simultaneous prompt to raise tickets (`gh` / `az boards`) AND fix selected findings; CI/PR gate verifies merge readiness |
+| **S6: Triage** | `issue_bridge.py` + Human | GitHub Issues / Azure DevOps + Fix | Simultaneous prompt to raise tickets (`gh` / `az boards`) AND fix selected findings; CI/PR artifact consistency check verifies merge readiness while branch protection + CODEOWNERS on `.sdlc/changes/**` enforces human approval |
 
 ## 2. Per-Change Isolation (`.sdlc/changes/<ticket>/`)
 
@@ -80,52 +80,94 @@ This repository uses the **6-Stage VeriGate AI-Native Software Development Lifec
      2. Fix Critical/High or ALL findings right now and re-verify?"""
 
 
-GITHUB_ACTIONS_CI_YML = """# VeriGate AI-SDLC Policy Gate (GitHub Actions)
-name: VeriGate AI-SDLC Policy Gate
+GITHUB_ACTIONS_CI_YML = """# VeriGate AI-SDLC Artifact Consistency Check (GitHub Actions)
+# Note: `validate` and `merge-check` are artifact consistency checks.
+# Enforce real human approval via GitHub branch protection + required CODEOWNERS reviewer on `.sdlc/changes/**`.
+name: VeriGate AI-SDLC Consistency Check
 on: [pull_request, push]
 jobs:
   verigate-verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Verify VeriGate Spec Approvals & Team Merge Policy
+      - name: VeriGate Artifact Consistency Checks (PR-Scoped)
         run: |
-          if [ -f .sdlc/intent.md ]; then
-            python3 .sdlc/bin/verigate.py validate --project .
+          set -e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.base_ref }}"
+            git fetch --no-tags origin "$BASE" 2>/dev/null || true
+            CHANGED_FILES="$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+          else
+            CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
           fi
-          if [ -f .sdlc/review-findings.json ]; then
-            python3 .sdlc/bin/verigate.py merge-check --project .
+          TOUCHED_CHANGES="$(printf '%s\n' "$CHANGED_FILES" | sed -n 's|^\\.sdlc/changes/\\([^/]*\\)/.*|\\1|p' | sort -u)"
+          ROOT_SDLC_TOUCHED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^\\.sdlc/[^/]+$' || true)"
+          if [ -n "$ROOT_SDLC_TOUCHED" ]; then
+            if [ -f .sdlc/intent.md ]; then
+              python3 .sdlc/bin/verigate.py validate --project .
+            fi
+            if [ -f .sdlc/review-findings.json ]; then
+              python3 .sdlc/bin/verigate.py merge-check --project .
+            fi
           fi
-          if [ -d .sdlc/changes ]; then
-            for d in .sdlc/changes/*; do
-              [ -d "$d" ] || continue
-              cid="$(basename "$d")"
-              if [ -f "$d/intent.md" ]; then
-                python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
-              fi
-              if [ -f "$d/review-findings.json" ]; then
-                python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
-              fi
-            done
+          for cid in $TOUCHED_CHANGES; do
+            [ -d ".sdlc/changes/$cid" ] || continue
+            if [ -f ".sdlc/changes/$cid/intent.md" ]; then
+              python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
+            fi
+            if [ -f ".sdlc/changes/$cid/review-findings.json" ]; then
+              python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
+            fi
+          done
+          if [ -z "$ROOT_SDLC_TOUCHED" ] && [ -z "$TOUCHED_CHANGES" ]; then
+            echo "No .sdlc/ or .sdlc/changes/<ticket>/ artifacts touched in this diff; skipping consistency checks."
           fi
-      - name: Optional Terraform / IaC Validation
+      - name: Optional Terraform / IaC Validation (Configured or Touched Dirs)
         run: |
-          if find . -maxdepth 4 -name '*.tf' -not -path './.git/*' -not -path './.terraform/*' | grep -q .; then
+          set -e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.base_ref }}"
+            CHANGED_FILES="$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+          else
+            CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+          fi
+          TF_DIRS="$(python3 -c '
+          import json, pathlib
+          p = pathlib.Path(".sdlc/config.json")
+          if p.is_file():
+              try:
+                  dirs = json.loads(p.read_text(encoding="utf-8")).get("terraform_dirs") or []
+                  for d in dirs:
+                      if isinstance(d, str) and d.strip():
+                          print(d.strip())
+              except Exception:
+                  pass
+          ')"
+          if [ -z "$TF_DIRS" ]; then
+            TF_DIRS="$(printf '%s\n' "$CHANGED_FILES" | grep -E '\\.tf$' | while IFS= read -r f; do [ -f "$f" ] && dirname "$f"; done | sort -u)"
+          fi
+          if [ -n "$TF_DIRS" ]; then
             if command -v terraform >/dev/null 2>&1; then
-              terraform fmt -check -recursive
-              terraform init -backend=false
-              terraform validate
+              printf '%s\n' "$TF_DIRS" | while IFS= read -r tf_dir; do
+                [ -d "$tf_dir" ] || continue
+                echo "Validating Terraform directory: $tf_dir"
+                (cd "$tf_dir" && terraform fmt -check && terraform init -backend=false && terraform validate) || exit 1
+              done
             else
-              echo "Terraform files detected; install terraform in CI runner to enforce fmt/validate."
+              echo "Terraform directories detected; install terraform in CI runner to enforce fmt/validate."
             fi
           fi
 """
 
 
-AZURE_PIPELINES_CI_YML = f"""{AZDO_VERIGATE_MARKER} (Azure Pipelines)
+AZURE_PIPELINES_CI_YML = AZDO_VERIGATE_MARKER + """ (Azure Pipelines)
+# Note: `validate` and `merge-check` are artifact consistency checks.
+# Enforce real human approval via Azure DevOps branch policies + required CODEOWNERS reviewer on `.sdlc/changes/**`.
 trigger:
   - main
 pr:
@@ -135,6 +177,9 @@ pool:
   vmImage: 'ubuntu-latest'
 
 steps:
+  - checkout: self
+    fetchDepth: 0
+
   - task: UsePythonVersion@0
     inputs:
       versionSpec: '3.12'
@@ -142,38 +187,70 @@ steps:
 
   - script: |
       set -e
-      if [ -f .sdlc/intent.md ]; then
-        python3 .sdlc/bin/verigate.py validate --project .
+      if [ "$(Build.Reason)" = "PullRequest" ]; then
+        git fetch --no-tags origin "$(System.PullRequest.TargetBranchName)" 2>/dev/null || true
+        CHANGED_FILES="$(git diff --name-only "origin/$(System.PullRequest.TargetBranchName)...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+      else
+        CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
       fi
-      if [ -f .sdlc/review-findings.json ]; then
-        python3 .sdlc/bin/verigate.py merge-check --project .
+      TOUCHED_CHANGES="$(printf '%s\n' "$CHANGED_FILES" | sed -n 's|^\\.sdlc/changes/\\([^/]*\\)/.*|\\1|p' | sort -u)"
+      ROOT_SDLC_TOUCHED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^\\.sdlc/[^/]+$' || true)"
+      if [ -n "$ROOT_SDLC_TOUCHED" ]; then
+        if [ -f .sdlc/intent.md ]; then
+          python3 .sdlc/bin/verigate.py validate --project .
+        fi
+        if [ -f .sdlc/review-findings.json ]; then
+          python3 .sdlc/bin/verigate.py merge-check --project .
+        fi
       fi
-      if [ -d .sdlc/changes ]; then
-        for d in .sdlc/changes/*; do
-          [ -d "$d" ] || continue
-          cid="$(basename "$d")"
-          if [ -f "$d/intent.md" ]; then
-            python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
-          fi
-          if [ -f "$d/review-findings.json" ]; then
-            python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
-          fi
-        done
+      for cid in $TOUCHED_CHANGES; do
+        [ -d ".sdlc/changes/$cid" ] || continue
+        if [ -f ".sdlc/changes/$cid/intent.md" ]; then
+          python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
+        fi
+        if [ -f ".sdlc/changes/$cid/review-findings.json" ]; then
+          python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
+        fi
+      done
+      if [ -z "$ROOT_SDLC_TOUCHED" ] && [ -z "$TOUCHED_CHANGES" ]; then
+        echo "No .sdlc/ or .sdlc/changes/<ticket>/ artifacts touched in this diff; skipping consistency checks."
       fi
-    displayName: 'Verify VeriGate Spec Approvals & Team Merge Policy'
+    displayName: 'VeriGate Artifact Consistency Checks (PR-Scoped)'
 
   - script: |
       set -e
-      if find . -maxdepth 4 -name '*.tf' -not -path './.git/*' -not -path './.terraform/*' | grep -q .; then
+      if [ "$(Build.Reason)" = "PullRequest" ]; then
+        CHANGED_FILES="$(git diff --name-only "origin/$(System.PullRequest.TargetBranchName)...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+      else
+        CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+      fi
+      TF_DIRS="$(python3 -c '
+      import json, pathlib
+      p = pathlib.Path(".sdlc/config.json")
+      if p.is_file():
+          try:
+              dirs = json.loads(p.read_text(encoding="utf-8")).get("terraform_dirs") or []
+              for d in dirs:
+                  if isinstance(d, str) and d.strip():
+                      print(d.strip())
+          except Exception:
+              pass
+      ')"
+      if [ -z "$TF_DIRS" ]; then
+        TF_DIRS="$(printf '%s\n' "$CHANGED_FILES" | grep -E '\\.tf$' | while IFS= read -r f; do [ -f "$f" ] && dirname "$f"; done | sort -u)"
+      fi
+      if [ -n "$TF_DIRS" ]; then
         if command -v terraform >/dev/null 2>&1; then
-          terraform fmt -check -recursive
-          terraform init -backend=false
-          terraform validate
+          printf '%s\n' "$TF_DIRS" | while IFS= read -r tf_dir; do
+            [ -d "$tf_dir" ] || continue
+            echo "Validating Terraform directory: $tf_dir"
+            (cd "$tf_dir" && terraform fmt -check && terraform init -backend=false && terraform validate) || exit 1
+          done
         else
-          echo "Terraform files detected; install terraform in CI agent to enforce fmt/validate."
+          echo "Terraform directories detected; install terraform in CI agent to enforce fmt/validate."
         fi
       fi
-    displayName: 'Optional Terraform / IaC Validation'
+    displayName: 'Optional Terraform / IaC Validation (Configured or Touched Dirs)'
 """
 
 
@@ -294,7 +371,7 @@ def _merge_claude_settings(settings_path: Path, aisdlc_hooks: dict, tx: _Install
         cur_list = [
             item
             for item in (hooks_obj.get(event_name) or [])
-            if "verigate.py hook" not in json.dumps(item)
+            if not re.search(r'verigate\.py\\?["\']?\s+hook\b', json.dumps(item))
         ]
         cur_list.extend(new_entries)
         hooks_obj[event_name] = cur_list
@@ -406,11 +483,12 @@ def install(
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
                 tx.copy_tree(sk, claude_dir / "skills" / sk.name)
+        claude_script = '"$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py"'
         claude_hooks = {
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _hook_cmd(".sdlc/bin/verigate.py", "claude", "UserPromptSubmit", py_cmd)}]}],
-            "PreToolUse": [{"matcher": CLAUDE_PRE_TOOL_MATCHER, "hooks": [{"type": "command", "command": _hook_cmd(".sdlc/bin/verigate.py", "claude", "PreToolUse", py_cmd)}]}],
-            "PostToolUse": [{"matcher": CLAUDE_POST_TOOL_MATCHER, "hooks": [{"type": "command", "command": _hook_cmd(".sdlc/bin/verigate.py", "claude", "PostToolUse", py_cmd)}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": _hook_cmd(".sdlc/bin/verigate.py", "claude", "Stop", py_cmd)}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _hook_cmd(claude_script, "claude", "UserPromptSubmit", py_cmd)}]}],
+            "PreToolUse": [{"matcher": CLAUDE_PRE_TOOL_MATCHER, "hooks": [{"type": "command", "command": _hook_cmd(claude_script, "claude", "PreToolUse", py_cmd)}]}],
+            "PostToolUse": [{"matcher": CLAUDE_POST_TOOL_MATCHER, "hooks": [{"type": "command", "command": _hook_cmd(claude_script, "claude", "PostToolUse", py_cmd)}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": _hook_cmd(claude_script, "claude", "Stop", py_cmd)}]}],
         }
         _merge_claude_settings(claude_dir / "settings.json", claude_hooks, tx=tx)
         installed.extend(["CLAUDE.md", ".claude/settings.json", ".claude/agents/*", ".claude/skills/*"])
@@ -472,12 +550,12 @@ def install(
         tx.write_text(azdo_path, AZURE_PIPELINES_CI_YML)
         installed.append(azdo_path.relative_to(target_dir).as_posix())
 
-    # 9. Universal Git Pre-Commit Hook (POSIX sh with python3 || python fallback)
+    # 9. Universal Git Pre-Commit Hook (POSIX sh with repo-root resolution + python3 || python fallback)
     if use_all or "git" in targets:
         pre_commit = target_dir / ".githooks" / "pre-commit"
         tx.write_text(
             pre_commit,
-            "#!/usr/bin/env sh\nset -e\nPY=python3\ncommand -v python3 >/dev/null 2>&1 || PY=python\nexec \"$PY\" .sdlc/bin/verigate.py hook --adapter git-pre-commit\n",
+            "#!/usr/bin/env sh\nset -e\nREPO_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"\nPY=python3\ncommand -v python3 >/dev/null 2>&1 || PY=python\nexec \"$PY\" \"$REPO_ROOT/.sdlc/bin/verigate.py\" hook --adapter git-pre-commit\n",
             executable=True,
         )
         installed.append(".githooks/pre-commit")

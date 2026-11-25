@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (v2.4 audit-hardened).
+"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (v2.5 audit-hardened).
 
 Run with:
     python3 -m unittest discover -s tests -v
@@ -522,12 +522,13 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertIn("verigate.py validate", azdo_text)
         self.assertIn("verigate.py merge-check", azdo_text)
 
-        # Gap #12: Generated .claude/settings.json and .agents/hooks.json do NOT wrap commands in `sh -c`
+        # Gap #12 & Finding #8: Generated .claude/settings.json and .agents/hooks.json do NOT wrap commands in `sh -c`
+        # and Claude hooks use `$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py`.
         claude_raw = (self.repo / ".claude/settings.json").read_text(encoding="utf-8")
         ag_raw = (self.repo / ".agents/hooks.json").read_text(encoding="utf-8")
         self.assertNotIn("sh -c", claude_raw)
         self.assertNotIn("sh -c", ag_raw)
-        self.assertIn("verigate.py hook", claude_raw)
+        self.assertIn("$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py", claude_raw)
         self.assertIn("verigate.py hook", ag_raw)
 
     def test_gaps4_and_5_readme_honest_control_framing(self) -> None:
@@ -539,6 +540,236 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertIn("human pr approval", lower)
         self.assertIn("azure-pipelines.yml", readme)
         self.assertIn("verigate-gate.yml", readme)
+
+    def test_v25_finding1_exact_test_runner_and_error_swallowing(self) -> None:
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src/svc.py").write_text("v = 1\n", encoding="utf-8")
+
+        non_verifying_cmds = [
+            "pip install pytest",
+            'git commit -m "add pytest config"',
+            "grep -r jest package.json",
+            "pytest || true",
+            "pytest; true",
+        ]
+        for idx, cmd in enumerate(non_verifying_cmds):
+            sid = f"f1-neg-{idx}"
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/svc.py"}, "cwd": str(self.repo)})
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+            self._hook(
+                {
+                    "session_id": sid,
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "tool_response": {"exit_code": 0},
+                    "cwd": str(self.repo),
+                }
+            )
+            s_blk = self._hook({"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+            self.assertEqual(s_blk.get("decision"), "block", f"Expected verified=False (Stop block) for: {cmd}")
+
+        for idx, cmd in enumerate(("pytest -q", "python3 -m unittest")):
+            sid = f"f1-pos-{idx}"
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/svc.py"}, "cwd": str(self.repo)})
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+            self._hook(
+                {
+                    "session_id": sid,
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "tool_response": {"exit_code": 0},
+                    "cwd": str(self.repo),
+                }
+            )
+            s_ok = self._hook({"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+            self.assertEqual(s_ok, {}, f"Expected verified=True (Stop allow) for: {cmd}")
+
+    def test_v25_finding2_quote_aware_write_detection_no_phantom_dirty(self) -> None:
+        # Spec lock is ON (--require-spec in setUp) and S1/S2 not approved.
+        safe_cmds = [
+            'git log --format="%h -> %s"',
+            'python -c "print(1>0)"',
+        ]
+        sid = "f2-quote"
+        for cmd in safe_cmds:
+            r_pre = self._hook(
+                {
+                    "session_id": sid,
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "cwd": str(self.repo),
+                }
+            )
+            self.assertEqual(r_pre["hookSpecificOutput"]["permissionDecision"], "allow", f"Expected allow for: {cmd}")
+            self._hook(
+                {
+                    "session_id": sid,
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": cmd},
+                    "tool_response": {"exit_code": 0},
+                    "cwd": str(self.repo),
+                }
+            )
+
+        session_file = pathlib.Path(self.env["VERIGATE_DATA_DIR"]) / f"session_{sid}.json"
+        if session_file.is_file():
+            sess = json.loads(session_file.read_text(encoding="utf-8"))
+            self.assertEqual(sess.get("dirtyFiles", []), [], f"Unexpected dirtyFiles: {sess.get('dirtyFiles')}")
+        s_ok = self._hook({"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_ok, {})
+
+    def test_v25_finding4_active_change_protection_and_branch_ticket(self) -> None:
+        # Writing .sdlc/active-change via Write -> ask
+        r_write = self._hook(
+            {
+                "session_id": "f4",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": ".sdlc/active-change"},
+                "cwd": str(self.repo),
+            }
+        )
+        self.assertEqual(r_write["hookSpecificOutput"]["permissionDecision"], "ask")
+
+        # Writing .sdlc/active-change via shell -> deny
+        r_sh = self._hook(
+            {
+                "session_id": "f4",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo PROJ-999 > .sdlc/active-change"},
+                "cwd": str(self.repo),
+            }
+        )
+        self.assertEqual(r_sh["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # Creating/checking out branch feature/PROJ-789-billing auto-derives change ID PROJ-789
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-b", "feature/PROJ-789-billing"], check=True, capture_output=True)
+        p_stat = subprocess.run(
+            [sys.executable, str(self.aisdlc_bin), "status", "--project", str(self.repo)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        stat = json.loads(p_stat.stdout)
+        self.assertEqual(stat["change_id"], "PROJ-789")
+        self.assertEqual(stat["artifact_dir"], ".sdlc/changes/PROJ-789")
+
+    def test_v25_findings6_and_7_pr_scoped_ci_and_terraform_dirs(self) -> None:
+        gh_yml = (self.repo / ".github/workflows/verigate-gate.yml").read_text(encoding="utf-8")
+        az_yml = (self.repo / "azure-pipelines.yml").read_text(encoding="utf-8")
+
+        for name, yml in (("github", gh_yml), ("azure", az_yml)):
+            self.assertIn("git diff --name-only", yml, f"{name} CI must scope via git diff")
+            self.assertIn("TOUCHED_CHANGES", yml, f"{name} CI must scope to touched .sdlc/changes/*")
+            self.assertIn("terraform_dirs", yml, f"{name} CI must read terraform_dirs from .sdlc/config.json")
+            self.assertIn("dirname", yml, f"{name} CI must fall back to touched .tf parent dirs")
+            self.assertIn("cd \"$tf_dir\" && terraform fmt -check && terraform init -backend=false && terraform validate", yml)
+            self.assertNotIn("terraform fmt -check -recursive", yml, f"{name} CI must not blindly run repo-wide terraform fmt")
+
+        self.assertIn("fetch-depth: 0", gh_yml)
+        self.assertIn("fetchDepth: 0", az_yml)
+
+        # Default config.json from `init` includes terraform_dirs
+        cfg = json.loads((self.repo / ".sdlc/config.json").read_text(encoding="utf-8"))
+        self.assertIn("terraform_dirs", cfg)
+        self.assertIsInstance(cfg["terraform_dirs"], list)
+
+    def test_v25_finding8_claude_project_dir_hook_path(self) -> None:
+        claude_cfg = json.loads((self.repo / ".claude/settings.json").read_text(encoding="utf-8"))
+        for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
+            entries = claude_cfg["hooks"][event]
+            self.assertTrue(entries, f"Missing Claude hook entries for {event}")
+            cmds = [h["command"] for e in entries for h in e.get("hooks", [])]
+            self.assertTrue(
+                any("$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py" in c for c in cmds),
+                f"Expected $CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py in {event} hooks: {cmds}",
+            )
+
+    def test_v25_finding9_string_and_dict_exit_code_detection(self) -> None:
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src/app.py").write_text("x = 1\n", encoding="utf-8")
+
+        # 1. String tool_response containing "Exit code 1" -> failed (verified stays False)
+        sid_str = "f9-str"
+        self._hook({"session_id": sid_str, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/app.py"}, "cwd": str(self.repo)})
+        self._hook({"session_id": sid_str, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+        self._hook(
+            {
+                "session_id": sid_str,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": "FAILED tests/test_app.py\nExit code 1",
+                "cwd": str(self.repo),
+            }
+        )
+        s_blk_str = self._hook({"session_id": sid_str, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_blk_str.get("decision"), "block")
+
+        # 2. Dict tool_response with exit_code: 1 -> failed (verified stays False)
+        sid_dict = "f9-dict"
+        self._hook({"session_id": sid_dict, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/app.py"}, "cwd": str(self.repo)})
+        self._hook({"session_id": sid_dict, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+        self._hook(
+            {
+                "session_id": sid_dict,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"exit_code": 1},
+                "cwd": str(self.repo),
+            }
+        )
+        s_blk_dict = self._hook({"session_id": sid_dict, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_blk_dict.get("decision"), "block")
+
+        # 3. Clean string tool_response (no non-zero exit code) -> verified=True -> Stop allows
+        debug_env = self.env.copy()
+        debug_env["VERIGATE_DEBUG_HOOK"] = "1"
+        self._hook(
+            {
+                "session_id": sid_str,
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": "3 passed in 0.12s",
+                "cwd": str(self.repo),
+            },
+            env_override=debug_env,
+        )
+        s_ok = self._hook({"session_id": sid_str, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_ok, {})
+        debug_log = pathlib.Path(self.env["VERIGATE_DATA_DIR"]) / "hook_debug.jsonl"
+        self.assertTrue(debug_log.is_file(), "Expected hook_debug.jsonl when VERIGATE_DEBUG_HOOK=1")
+
+    def test_v25_findings3_and_5_docs_limits_codeowners_consistency(self) -> None:
+        readme = (KIT_ROOT / "README.md").read_text(encoding="utf-8")
+        for limit_token in ("Path.write_text", "git apply", "New-Item", "curl -o"):
+            self.assertIn(limit_token, readme, f"README.md missing known limit: {limit_token}")
+        self.assertIn("CODEOWNERS", readme)
+        self.assertIn(".sdlc/changes/**", readme)
+        self.assertIn("consistency", readme.lower())
+
+        # Also verify merge-check JSON note frames it as a consistency check
+        (self.repo / ".sdlc/review-findings.json").write_text(
+            json.dumps({"verdict": "APPROVE", "quality_score": 95, "findings": []}),
+            encoding="utf-8",
+        )
+        p_mc = subprocess.run(
+            [sys.executable, str(self.aisdlc_bin), "merge-check", "--project", str(self.repo)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        mc_data = json.loads(p_mc.stdout)
+        self.assertIn("consistency", mc_data.get("note", "").lower())
 
 
 if __name__ == "__main__":
