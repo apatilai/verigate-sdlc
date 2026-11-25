@@ -23,7 +23,7 @@ KIT_ROOT = Path(__file__).resolve().parent
 MARKER_START = "<!-- VERIGATE:START -->"
 MARKER_END = "<!-- VERIGATE:END -->"
 AZDO_VERIGATE_MARKER = "# VeriGate AI-SDLC Policy Gate"
-DEFAULT_VERIGATE_REF = "v3.1.0"
+DEFAULT_VERIGATE_REF = "v3.1.1"
 DEFAULT_VERIGATE_REPO = "https://github.com/apatilai/verigate-sdlc.git"
 
 CLAUDE_PRE_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell"
@@ -145,7 +145,7 @@ jobs:
           VERIGATE_BIN="${{RUNNER_TEMP:-/tmp}}/verigate/bin"
           if [ "${{{{ github.event_name }}}}" = "pull_request" ]; then
             BASE="${{{{ github.base_ref }}}}"
-            git fetch --no-tags origin "$BASE" 2>/dev/null || true
+            git fetch --no-tags origin "$BASE"
             python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "origin/$BASE"
           else
             python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "HEAD~1"
@@ -207,7 +207,7 @@ steps:
       VERIGATE_BIN="$(Agent.TempDirectory)/verigate/bin"
       if [ "$(Build.Reason)" = "PullRequest" ]; then
         BASE="$(System.PullRequest.TargetBranchName)"
-        git fetch --no-tags origin "$BASE" 2>/dev/null || true
+        git fetch --no-tags origin "$BASE"
         python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "origin/$BASE"
       else
         python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "HEAD~1"

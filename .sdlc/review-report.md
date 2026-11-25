@@ -1,15 +1,12 @@
-# Stage 5 Governed Code Review Report — VeriGate AI-SDLC v3.1.0
+# Stage 5 Governed Code Review Report — VeriGate AI-SDLC v3.1.1
 
 - **Verdict**: `APPROVE`
 - **Score**: `100 / 100`
-- **Test Verification**: `28 / 28` tests passing (`python3 -m unittest discover -s tests -v`)
+- **Test Verification**: `29 / 29` tests passing (`python3 -m unittest discover -s tests -v`)
 - **Open Findings**: `0` (Critical: 0, High: 0, Medium: 0, Low: 0)
 
-## v3.1.0 Changes Verified
-1. **Windows `shlex.split` fix + list-form `verify` commands**: `_split_verify_command()` in `bin/verigate.py` preserves Windows backslashes (e.g., `C:\Python314\python.exe -m unittest`) via non-POSIX splitting and accepts list-form argv arrays directly.
-2. **Test runner flag hardening**: `_segment_is_test_runner()` rejects `-h`, `--help`, `--version`, `-V`, `--collect-only`, and `--co`.
-3. **Target-branch config & policy loading in `ci-check`**: `load_config(..., git_ref=base_ref)` and `load_policy(..., git_ref=base_ref)` load `verigate.json`/`.sdlc/config.json`/`.sdlc/policy.json` from `--base` via `git show <base>:...` so a PR cannot weaken its own rules.
-4. **Mandatory review in CI by default**: `.sdlc/policy.json` defaults to `"require_review_in_ci": true`; omitting `review-findings.json` fails `ci-check`.
-5. **`.gitignore` upsert in `install_verigate.py`**: Automatically ignores `.sdlc/verify-result.json`, `.sdlc/changes/*/verify-result.json`, `.sdlc/audit.jsonl`, `.sdlc/waivers.jsonl`, `.sdlc/changes/*/waivers.jsonl`, and `.sdlc/backups/`.
-6. **New-branch `git-pre-push` merge-base diff**: Checks `<merge-base>..HEAD` against `origin/main`, `origin/master`, `main`, or `master` when no upstream `@{u}` is configured.
-7. **Azure Pipelines accuracy**: Uses `pr: none` with Azure Repos Branch Policies → Build Validation and Automatically Included Reviewers (`/.sdlc/changes/*`) instead of `pr:` / `CODEOWNERS`.
+## v3.1.1 Fail-Closed Hardening
+1. **Unresolvable `--base` ref fails closed**: `load_config()` and `load_policy()` verify `_git_ref_exists(abs_root, git_ref)` first; `ci-check` exits `1` (`BASE_REF_CONFIG_ERROR`) instead of falling back to the PR branch.
+2. **Malformed base-branch config/policy fails closed**: `_read_git_ref_json_status()` distinguishes absent files (first-adoption PR → `working_tree_fallback`) from malformed JSON on `--base` (`invalid_base_config:<ref>` → exits `1`).
+3. **CI `git fetch` no longer swallows errors**: Removed `2>/dev/null || true` from `git fetch --no-tags origin "$BASE"` in both GitHub Actions and Azure Pipelines templates.
+4. **Empty `verify` list rejected**: `run_verify_rules()` fails closed (`empty_verify: true`, `VERIFY_EMPTY_RULE`) when a matched `gated_paths` rule has an empty `verify` list unless `"allow_empty_verify": true` is explicitly configured.

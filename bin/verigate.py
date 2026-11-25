@@ -281,7 +281,27 @@ DEFAULT_BRANCH_PATTERN = r"([A-Z][A-Z0-9]{1,10}-\d+)"
 TREE_SKIP_DIRS = {".git", ".sdlc", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
 
-def _read_git_ref_json(abs_root: str, git_ref: str, rel_path: str) -> dict | None:
+def _git_ref_exists(abs_root: str, git_ref: str) -> bool:
+    if not git_ref or not git_ref.strip():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", abs_root, "rev-parse", "--verify", "--quiet", f"{git_ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _read_git_ref_json_status(abs_root: str, git_ref: str, rel_path: str) -> tuple[dict | None, str | None]:
+    """Read a JSON object from `git_ref:rel_path`.
+
+    Returns `(dict, None)` when present and valid, `(None, None)` when absent on `git_ref`,
+    and `(None, error_msg)` when present on `git_ref` but malformed JSON or not a JSON object.
+    """
     try:
         proc = subprocess.run(
             ["git", "-C", abs_root, "show", f"{git_ref}:{rel_path}"],
@@ -290,11 +310,20 @@ def _read_git_ref_json(abs_root: str, git_ref: str, rel_path: str) -> dict | Non
             timeout=5,
         )
         if proc.returncode != 0:
-            return None
+            return None, None
         loaded = json.loads(proc.stdout)
-        return loaded if isinstance(loaded, dict) else None
-    except Exception:
-        return None
+        if not isinstance(loaded, dict):
+            return None, f"Invalid JSON object in `{git_ref}:{rel_path}` (expected top-level object)."
+        return loaded, None
+    except json.JSONDecodeError as exc:
+        return None, f"Malformed JSON in `{git_ref}:{rel_path}`: {exc}"
+    except Exception as exc:
+        return None, f"Failed reading `{git_ref}:{rel_path}`: {exc}"
+
+
+def _read_git_ref_json(abs_root: str, git_ref: str, rel_path: str) -> dict | None:
+    loaded, _err = _read_git_ref_json_status(abs_root, git_ref, rel_path)
+    return loaded
 
 
 def _normalize_verify_items(verify_cmds: object) -> list[str | list[str]]:
@@ -318,25 +347,41 @@ def load_config(project_root: str, git_ref: str | None = None) -> dict:
 
     When `git_ref` is provided (e.g. target branch `origin/main` in `ci-check`), config is loaded from
     `git_ref` first so an untrusted PR branch cannot weaken its own `gated_paths` or `verify` commands.
-    Falls back to the working tree only when neither config file exists on `git_ref`.
+    Falls back to the working tree ONLY when `git_ref` resolves and neither config file exists on `git_ref`
+    (first adoption PR). Unresolvable `git_ref` or malformed JSON on `git_ref` records `config_errors`
+    and does NOT fall back to the PR branch.
     """
     abs_root = os.path.realpath(project_root)
     raw: dict = {}
     config_source = "working_tree"
+    config_errors: list[str] = []
+    allow_working_tree_fallback = True
 
     if git_ref:
-        ref_raw: dict = {}
-        for rel_cfg in (".sdlc/config.json", "verigate.json"):
-            loaded = _read_git_ref_json(abs_root, git_ref, rel_cfg)
-            if loaded:
-                ref_raw.update(loaded)
-        if ref_raw:
-            raw = ref_raw
-            config_source = f"base_ref:{git_ref}"
+        if not _git_ref_exists(abs_root, git_ref):
+            config_source = f"unresolvable_base_ref:{git_ref}"
+            config_errors.append(
+                f"Base ref `{git_ref}` cannot be resolved; fetch the target branch before running ci-check."
+            )
+            allow_working_tree_fallback = False
         else:
-            config_source = "working_tree_fallback"
+            ref_raw: dict = {}
+            for rel_cfg in (".sdlc/config.json", "verigate.json"):
+                loaded, err = _read_git_ref_json_status(abs_root, git_ref, rel_cfg)
+                if err:
+                    config_errors.append(err)
+                elif loaded:
+                    ref_raw.update(loaded)
+            if config_errors:
+                config_source = f"invalid_base_config:{git_ref}"
+                allow_working_tree_fallback = False
+            elif ref_raw:
+                raw = ref_raw
+                config_source = f"base_ref:{git_ref}"
+            else:
+                config_source = "working_tree_fallback"
 
-    if not raw:
+    if not raw and allow_working_tree_fallback:
         for cfg_path in (
             os.path.join(abs_root, ".sdlc", "config.json"),
             os.path.join(abs_root, "verigate.json"),
@@ -359,6 +404,7 @@ def load_config(project_root: str, git_ref: str | None = None) -> dict:
                         "pattern": str(item["pattern"]),
                         "verify": _normalize_verify_items(item.get("verify")),
                         "cwd": str(item.get("cwd") or "."),
+                        "allow_empty_verify": bool(item.get("allow_empty_verify", False)),
                     }
                 )
 
@@ -395,8 +441,9 @@ def load_config(project_root: str, git_ref: str | None = None) -> dict:
     }
 
     return {
-        "version": str(raw.get("version") or "3.1.0"),
+        "version": str(raw.get("version") or "3.1.1"),
         "config_source": config_source,
+        "config_errors": config_errors,
         "require_spec_approval": require_spec,
         "require_change_folder_for_gated_paths": require_change_folder,
         "fail_on_missing_tool": fail_on_missing_tool,
@@ -574,7 +621,28 @@ def run_verify_rules(project_root: str, rules: list[dict], fail_on_missing_tool:
         rule_cwd = os.path.realpath(os.path.join(abs_root, cwd_rel))
         cmds = rule.get("verify") or []
         if isinstance(cmds, str):
-            cmds = [cmds]
+            cmds = [cmds] if cmds.strip() else []
+        if not cmds:
+            if not rule.get("allow_empty_verify", False):
+                results.append(
+                    {
+                        "pattern": pattern,
+                        "command": "",
+                        "cwd": cwd_rel,
+                        "exit_code": 2,
+                        "missing_tool": False,
+                        "skipped_missing_tool": False,
+                        "empty_verify": True,
+                        "passed": False,
+                        "duration_ms": 0,
+                        "stdout_tail": "",
+                        "stderr_tail": (
+                            f"Gated path rule `{pattern}` has an empty `verify` list. "
+                            "Configure at least one verification command (or set `\"allow_empty_verify\": true`)."
+                        ),
+                    }
+                )
+            continue
         for cmd in cmds:
             try:
                 argv, cmd_str = _split_verify_command(cmd)
@@ -1615,16 +1683,25 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
 def load_policy(project_root: str, git_ref: str | None = None) -> dict:
     """Load `.sdlc/policy.json`, preferring `git_ref` when provided so PRs cannot weaken merge policy."""
     abs_root = os.path.realpath(project_root)
-    policy = {
+    policy: dict = {
         "require_zero_findings": True,
         "require_review_in_ci": True,
         "max_open_critical": 0,
         "max_open_high": 0,
         "min_quality_score": 85,
         "max_review_fix_cycles": 3,
+        "_policy_errors": [],
     }
     if git_ref:
-        ref_pol = _read_git_ref_json(abs_root, git_ref, ".sdlc/policy.json")
+        if not _git_ref_exists(abs_root, git_ref):
+            policy["_policy_errors"].append(
+                f"Base ref `{git_ref}` cannot be resolved when loading `.sdlc/policy.json`."
+            )
+            return policy
+        ref_pol, err = _read_git_ref_json_status(abs_root, git_ref, ".sdlc/policy.json")
+        if err:
+            policy["_policy_errors"].append(err)
+            return policy
         if ref_pol:
             policy.update(ref_pol)
             return policy
@@ -1821,9 +1898,36 @@ def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: st
     abs_root = os.path.realpath(project_root)
     config = load_config(abs_root, git_ref=base_ref)
     policy = load_policy(abs_root, git_ref=base_ref)
+    head_commit = _git_head_commit(abs_root)
+
+    base_errors = list(config.get("config_errors") or []) + list(policy.get("_policy_errors") or [])
+    if base_errors:
+        dedup_errors = list(dict.fromkeys(base_errors))
+        reasons = [f"BASE_REF_CONFIG_ERROR: {err}" for err in dedup_errors]
+        out = {
+            "status": "FAILED",
+            "passed": False,
+            "base_ref": base_ref,
+            "config_source": config.get("config_source"),
+            "head_commit": head_commit,
+            "artifact_dir": None,
+            "change_id": change_id,
+            "touched_files": [],
+            "gated_paths_touched": [],
+            "trusted_laptop_verify_result": False,
+            "checks": {"base_ref": {"passed": False, "errors": dedup_errors}},
+            "blocking_reasons": reasons,
+        }
+        append_audit(
+            abs_root,
+            "CI_CHECK_FAILED",
+            {"change_id": change_id, "head_commit": head_commit, "base_ref": base_ref, "reasons": reasons},
+        )
+        print(json.dumps(out, indent=2))
+        return 1
+
     touched_files = _git_diff_pr_files(abs_root, base_ref)
     gated_touched = [p for p in touched_files if is_path_gated(p, config)]
-    head_commit = _git_head_commit(abs_root)
 
     resolved_cid = resolve_change_id(abs_root, change_id, strict=bool(change_id))
     if not resolved_cid:
@@ -1884,7 +1988,11 @@ def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: st
     if not v_passed:
         for r in v_results:
             if not r["passed"]:
-                if r.get("missing_tool"):
+                if r.get("empty_verify"):
+                    reasons.append(
+                        f"VERIFY_EMPTY_RULE ({r['pattern']}): gated path rule has an empty `verify` list."
+                    )
+                elif r.get("missing_tool"):
                     reasons.append(
                         f"VERIFY_MISSING_TOOL ({r['pattern']}): `{r['command']}` not found (fail_on_missing_tool=true)."
                     )

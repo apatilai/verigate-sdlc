@@ -1,9 +1,9 @@
 {
-  "version": "3.1.0",
+  "version": "3.1.1",
   "verdict": "APPROVE",
   "score": 100,
-  "reviewed_at": "2026-11-26T07:43:00Z",
-  "summary": "VeriGate AI-SDLC v3.1.0 fixes the Windows shlex.split backslash stripping bug (plus list-form verify commands), blocks pytest --help/--version/--collect-only false positives, loads ci-check config and policy from the target base branch (--base), enforces require_review_in_ci=true by default, upserts verify-result.json into .gitignore via install_verigate.py, checks merge-base..HEAD in git-pre-push for new branches without upstream, and fixes Azure Pipelines Build Validation & Automatically Included Reviewers guidance. All 28 unit tests pass.",
+  "reviewed_at": "2026-11-26T08:29:00Z",
+  "summary": "VeriGate AI-SDLC v3.1.1 fails closed in ci-check when --base cannot be resolved or when base-branch config/policy JSON is malformed (allowing working_tree_fallback only on first-adoption PRs where --base resolves with no config), removes `|| true` from CI `git fetch` commands, and rejects gated_paths rules with empty verify lists unless explicitly opted in with allow_empty_verify: true.",
   "counts": {
     "Critical": 0,
     "High": 0,

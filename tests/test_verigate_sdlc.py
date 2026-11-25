@@ -1439,6 +1439,148 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertIn("services/svc.py", d_ci["gated_paths_touched"])
         self.assertFalse(d_ci["passed"])
 
+    def test_v311_fail_closed_base_ref_broken_base_config_and_empty_verify(self) -> None:
+        # 1. Unresolvable --base ref MUST fail closed (never fall back to PR branch)
+        repo = self.tmp_dir / "vg_v311_base"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True, capture_output=True)
+        subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(repo), "--targets", "git,ci,azdo-ci"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        vbin = repo / ".sdlc" / "bin" / "verigate.py"
+
+        # Generated CI workflows must NOT swallow `git fetch` failures with `|| true`
+        gh_yml = (repo / ".github" / "workflows" / "verigate-gate.yml").read_text(encoding="utf-8")
+        az_yml = (repo / "azure-pipelines.yml").read_text(encoding="utf-8")
+        self.assertNotIn("git fetch --no-tags origin \"$BASE\" 2>/dev/null || true", gh_yml)
+        self.assertNotIn("git fetch --no-tags origin \"$BASE\" 2>/dev/null || true", az_yml)
+        self.assertIn('git fetch --no-tags origin "$BASE"', gh_yml)
+        self.assertIn('git fetch --no-tags origin "$BASE"', az_yml)
+
+        (repo / "verigate.json").write_text(
+            json.dumps(
+                {
+                    "version": "3.1.1",
+                    "require_change_folder_for_gated_paths": True,
+                    "gated_paths": [{"pattern": "services/**", "verify": [[sys.executable, "-c", "import sys; sys.exit(0)"]]}],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "chore: base main"], check=True, capture_output=True, env=self.env)
+
+        # PR branch empties gated_paths, then runs ci-check with a nonexistent base ref -> MUST FAIL CLOSED
+        subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/PROJ-911-missing-base"], check=True, capture_output=True)
+        (repo / "verigate.json").write_text(json.dumps({"gated_paths": []}, indent=2), encoding="utf-8")
+        (repo / "services").mkdir()
+        (repo / "services/app.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "feat: tamper"], check=True, capture_output=True, env=self.env)
+
+        p_missing = subprocess.run(
+            [sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "origin/does-not-exist"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_missing.returncode, 0)
+        d_missing = json.loads(p_missing.stdout)
+        self.assertFalse(d_missing["passed"])
+        self.assertEqual(d_missing["config_source"], "unresolvable_base_ref:origin/does-not-exist")
+        self.assertTrue(any("BASE_REF_CONFIG_ERROR" in r for r in d_missing["blocking_reasons"]))
+
+        # 2. Malformed verigate.json on target base branch MUST fail closed (never fall back to PR branch)
+        subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True)
+        (repo / "verigate.json").write_text("{ broken json", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "verigate.json"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "chore: broken base config"], check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "checkout", "feature/PROJ-911-missing-base"], check=True, capture_output=True)
+
+        p_broken = subprocess.run(
+            [sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_broken.returncode, 0)
+        d_broken = json.loads(p_broken.stdout)
+        self.assertFalse(d_broken["passed"])
+        self.assertEqual(d_broken["config_source"], "invalid_base_config:main")
+        self.assertTrue(any("Malformed JSON" in r for r in d_broken["blocking_reasons"]))
+
+        # 3. First-adoption PR: base branch resolves and has NO config -> working_tree_fallback allowed
+        repo_adopt = self.tmp_dir / "vg_v311_adopt"
+        repo_adopt.mkdir()
+        subprocess.run(["git", "-C", str(repo_adopt), "init", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_adopt), "config", "user.email", "test@example.com"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_adopt), "config", "user.name", "Test User"], check=True, capture_output=True)
+        (repo_adopt / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_adopt), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_adopt), "commit", "--no-verify", "-m", "init"], check=True, capture_output=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo_adopt), "checkout", "-b", "feature/PROJ-912-adopt"], check=True, capture_output=True)
+        subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(repo_adopt), "--targets", "git"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        vbin_adopt = repo_adopt / ".sdlc" / "bin" / "verigate.py"
+        (repo_adopt / "verigate.json").write_text(
+            json.dumps({"gated_paths": [{"pattern": "services/**", "verify": [[sys.executable, "-c", "import sys; sys.exit(0)"]]}]}, indent=2),
+            encoding="utf-8",
+        )
+        (repo_adopt / "docs").mkdir()
+        (repo_adopt / "docs/info.md").write_text("docs only\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_adopt), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_adopt), "commit", "--no-verify", "-m", "chore: adopt verigate"], check=True, capture_output=True, env=self.env)
+
+        p_adopt = subprocess.run(
+            [sys.executable, str(vbin_adopt), "ci-check", "--project", str(repo_adopt), "--base", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_adopt.returncode, 0, p_adopt.stdout + p_adopt.stderr)
+        d_adopt = json.loads(p_adopt.stdout)
+        self.assertEqual(d_adopt["config_source"], "working_tree_fallback")
+        self.assertTrue(d_adopt["passed"])
+
+        # 4. Empty `verify: []` on a gated path MUST fail closed unless `allow_empty_verify: true`
+        (repo_adopt / "verigate.json").write_text(
+            json.dumps({"gated_paths": [{"pattern": "services/**", "verify": []}]}, indent=2),
+            encoding="utf-8",
+        )
+        p_empty = subprocess.run(
+            [sys.executable, str(vbin_adopt), "verify", "--project", str(repo_adopt), "--change", "PROJ-912"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_empty.returncode, 0)
+        d_empty = json.loads(p_empty.stdout)
+        self.assertFalse(d_empty["passed"])
+        self.assertTrue(any(r.get("empty_verify") for r in d_empty["results"]))
+
+        (repo_adopt / "verigate.json").write_text(
+            json.dumps({"gated_paths": [{"pattern": "services/**", "verify": [], "allow_empty_verify": True}]}, indent=2),
+            encoding="utf-8",
+        )
+        p_allow = subprocess.run(
+            [sys.executable, str(vbin_adopt), "verify", "--project", str(repo_adopt), "--change", "PROJ-912"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_allow.returncode, 0, p_allow.stdout + p_allow.stderr)
+        self.assertTrue(json.loads(p_allow.stdout)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
