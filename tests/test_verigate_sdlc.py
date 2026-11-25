@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (v2.5 audit-hardened).
+"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (v3.0).
 
 Run with:
     python3 -m unittest discover -s tests -v
@@ -519,8 +519,9 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertTrue((ci_repo / "azure-pipelines.yml").is_file())
         self.assertTrue((ci_repo / ".github/workflows/verigate-gate.yml").is_file())
         azdo_text = (ci_repo / "azure-pipelines.yml").read_text(encoding="utf-8")
-        self.assertIn("verigate.py validate", azdo_text)
-        self.assertIn("verigate.py merge-check", azdo_text)
+        self.assertIn("VERIGATE_REF", azdo_text)
+        self.assertIn("ci-check --project .", azdo_text)
+        self.assertNotIn(".sdlc/bin/verigate.py", azdo_text)
 
         # Gap #12 & Finding #8: Generated .claude/settings.json and .agents/hooks.json do NOT wrap commands in `sh -c`
         # and Claude hooks use `$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py`.
@@ -534,10 +535,10 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
     def test_gaps4_and_5_readme_honest_control_framing(self) -> None:
         readme = (KIT_ROOT / "README.md").read_text(encoding="utf-8")
         lower = readme.lower()
-        self.assertIn("local agent guide rails", lower)
-        self.assertIn("hard enterprise controls", lower)
+        self.assertIn("three-layer control architecture", lower)
+        self.assertIn("optional early-feedback adapters", lower)
         self.assertIn("branch protection", lower)
-        self.assertIn("human pr approval", lower)
+        self.assertIn("human approval", lower)
         self.assertIn("azure-pipelines.yml", readme)
         self.assertIn("verigate-gate.yml", readme)
 
@@ -665,20 +666,22 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         az_yml = (self.repo / "azure-pipelines.yml").read_text(encoding="utf-8")
 
         for name, yml in (("github", gh_yml), ("azure", az_yml)):
-            self.assertIn("git diff --name-only", yml, f"{name} CI must scope via git diff")
-            self.assertIn("TOUCHED_CHANGES", yml, f"{name} CI must scope to touched .sdlc/changes/*")
-            self.assertIn("terraform_dirs", yml, f"{name} CI must read terraform_dirs from .sdlc/config.json")
-            self.assertIn("dirname", yml, f"{name} CI must fall back to touched .tf parent dirs")
-            self.assertIn("cd \"$tf_dir\" && terraform fmt -check && terraform init -backend=false && terraform validate", yml)
+            self.assertIn("VERIGATE_REF", yml, f"{name} CI must pin VERIGATE_REF")
+            self.assertIn("VERIGATE_REPO", yml, f"{name} CI must define VERIGATE_REPO")
+            self.assertIn("ci-check --project . --base", yml, f"{name} CI must invoke pinned ci-check")
+            self.assertNotIn(".sdlc/bin/verigate.py", yml, f"{name} CI must never run untrusted PR-branch verigate.py")
             self.assertNotIn("terraform fmt -check -recursive", yml, f"{name} CI must not blindly run repo-wide terraform fmt")
 
         self.assertIn("fetch-depth: 0", gh_yml)
         self.assertIn("fetchDepth: 0", az_yml)
 
-        # Default config.json from `init` includes terraform_dirs
+        # Default config.json from `init` includes v3.0 keys + backward-compatible terraform_dirs
         cfg = json.loads((self.repo / ".sdlc/config.json").read_text(encoding="utf-8"))
         self.assertIn("terraform_dirs", cfg)
         self.assertIsInstance(cfg["terraform_dirs"], list)
+        self.assertEqual(cfg.get("version"), "3.0.0")
+        self.assertIn("gated_paths", cfg)
+        self.assertIn("fail_on_missing_tool", cfg)
 
     def test_v25_finding8_claude_project_dir_hook_path(self) -> None:
         claude_cfg = json.loads((self.repo / ".claude/settings.json").read_text(encoding="utf-8"))
@@ -770,6 +773,567 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         )
         mc_data = json.loads(p_mc.stdout)
         self.assertIn("consistency", mc_data.get("note", "").lower())
+
+    def test_v26_live_trial_fixes(self) -> None:
+        # 1. Chained trailing commands after test runner must NEVER mark verified (live Claude Code payload has no exit_code)
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src/calc.py").write_text("def add(a, b): return a + b\n", encoding="utf-8")
+        self._hook({"session_id": "live1", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/calc.py"}, "cwd": str(self.repo)})
+        self._hook({"session_id": "live1", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+
+        real_claude_resp = {"stdout": "Ran 3 tests\nFAILED (failures=2)\ndone\n", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        for bad_cmd in (
+            "python -m unittest discover -s tests; echo done",
+            'pytest; echo "exit=$?"',
+            "pytest && echo done",
+            "pytest | tail -n 5",
+        ):
+            self._hook(
+                {"session_id": "live1", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": bad_cmd}, "tool_response": real_claude_resp, "cwd": str(self.repo)}
+            )
+            sess_file = pathlib.Path(self.env["VERIGATE_DATA_DIR"]) / "session_live1.json"
+            self.assertFalse(json.loads(sess_file.read_text(encoding="utf-8")).get("verified"), f"Should NOT verify on: {bad_cmd}")
+
+        # Even a standalone test command with FAILED output in stdout/stderr must NOT mark verified
+        self._hook(
+            {"session_id": "live1", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "python -m unittest discover -s tests"}, "tool_response": real_claude_resp, "cwd": str(self.repo)}
+        )
+        sess_file = pathlib.Path(self.env["VERIGATE_DATA_DIR"]) / "session_live1.json"
+        self.assertFalse(json.loads(sess_file.read_text(encoding="utf-8")).get("verified"))
+
+        # Stop block message clearly says Not a crash
+        s_blk = self._hook({"session_id": "live1", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_blk["decision"], "block")
+        self.assertIn("Not a crash", s_blk["reason"])
+
+        # Clean standalone test run with clean stdout marks verified
+        clean_resp = {"stdout": "Ran 3 tests\nOK\n", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
+        self._hook(
+            {"session_id": "live1", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "cd . && python -m unittest discover -s tests"}, "tool_response": clean_resp, "cwd": str(self.repo)}
+        )
+        self.assertTrue(json.loads(sess_file.read_text(encoding="utf-8")).get("verified"))
+
+        # 2. issue_bridge.py detect/preview -> allow; create -> ask/force_ask; chained -> deny
+        r_det = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "python .sdlc/bin/issue_bridge.py detect --repo ."}, "cwd": str(self.repo)})
+        self.assertEqual(r_det["hookSpecificOutput"]["permissionDecision"], "allow")
+        r_cr = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "python .sdlc/bin/issue_bridge.py create --findings .sdlc/review-findings.json"}, "cwd": str(self.repo)})
+        self.assertEqual(r_cr["hookSpecificOutput"]["permissionDecision"], "ask")
+        r_cr_chain = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "python .sdlc/bin/issue_bridge.py create --findings .sdlc/review-findings.json; true"}, "cwd": str(self.repo)})
+        self.assertEqual(r_cr_chain["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # 3. Read-only inspection on .sdlc/bin allowed; destructive commands & shadow_ledger remain denied
+        r_ls = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls .sdlc/bin"}, "cwd": str(self.repo)})
+        self.assertEqual(r_ls["hookSpecificOutput"]["permissionDecision"], "allow")
+        r_cat = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cat .sdlc/intent.md .sdlc/spec.md"}, "cwd": str(self.repo)})
+        self.assertEqual(r_cat["hookSpecificOutput"]["permissionDecision"], "allow")
+        r_rm = self._hook({"session_id": "live2", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm .sdlc/bin/verigate.py"}, "cwd": str(self.repo)})
+        self.assertEqual(r_rm["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def _init_v3_repo(self, name: str, config: dict) -> tuple[pathlib.Path, pathlib.Path]:
+        repo = self.tmp_dir / name
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "ci@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "CI"], check=True)
+        subprocess.run(
+            [
+                sys.executable,
+                str(KIT_ROOT / "install_verigate.py"),
+                "--target",
+                str(repo),
+                "--targets",
+                "git,ci",
+                "--activate-git-hooks",
+            ],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        (repo / "verigate.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        (repo / "README.md").write_text("# Sample Repo\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--no-verify", "-m", "chore: bootstrap repo"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        return repo, repo / ".sdlc" / "bin" / "verigate.py"
+
+    def test_v30_declarative_config_gated_paths(self) -> None:
+        cfg = {
+            "version": "3.0.0",
+            "require_spec_approval": True,
+            "require_change_folder_for_gated_paths": True,
+            "fail_on_missing_tool": True,
+            "gated_paths": [
+                {
+                    "pattern": "services/**",
+                    "verify": [f"{sys.executable} -c 'print(\"ok\")'"],
+                    "cwd": ".",
+                }
+            ],
+        }
+        repo, vbin = self._init_v3_repo("v3-gated", cfg)
+
+        # Non-gated path (docs/notes.md) is allowed without a change folder in git-pre-commit
+        (repo / "docs").mkdir()
+        (repo / "docs/notes.md").write_text("# Notes\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "docs/notes.md"], check=True)
+        p_doc = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-commit"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_doc.returncode, 0, p_doc.stderr)
+
+        # Also allowed in PreToolUse AI hook without a change folder
+        r_doc_hook = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "auto"],
+            input=json.dumps(
+                {
+                    "session_id": "v3-gp",
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": "docs/notes.md"},
+                    "cwd": str(repo),
+                }
+            ),
+            text=True,
+            capture_output=True,
+            cwd=str(repo),
+            env=self.env,
+        )
+        self.assertEqual(r_doc_hook.returncode, 0)
+        self.assertEqual(json.loads(r_doc_hook.stdout)["hookSpecificOutput"]["permissionDecision"], "allow")
+
+        # Gated path (services/api.py) without change folder is DENIED in git-pre-commit and PreToolUse
+        (repo / "services").mkdir()
+        (repo / "services/api.py").write_text("def handle(): return 200\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "services/api.py"], check=True)
+        p_svc = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-commit"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_svc.returncode, 0)
+        self.assertIn("Change Folder Gate", p_svc.stderr)
+
+        r_svc_hook = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "auto"],
+            input=json.dumps(
+                {
+                    "session_id": "v3-gp",
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": "services/api.py"},
+                    "cwd": str(repo),
+                }
+            ),
+            text=True,
+            capture_output=True,
+            cwd=str(repo),
+            env=self.env,
+        )
+        self.assertEqual(r_svc_hook.returncode, 0)
+        self.assertEqual(json.loads(r_svc_hook.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_v30_real_verify_commit_bound_and_missing_tool_fail_closed(self) -> None:
+        # 1. Passing verify command writes commit-bound verify-result.json
+        cfg_pass = {
+            "version": "3.0.0",
+            "fail_on_missing_tool": True,
+            "gated_paths": [
+                {
+                    "pattern": "services/**",
+                    "verify": [f"{sys.executable} -c 'import sys; sys.exit(0)'"],
+                    "cwd": ".",
+                }
+            ],
+        }
+        repo, vbin = self._init_v3_repo("v3-verify", cfg_pass)
+        (repo / "services").mkdir()
+        (repo / "services/api.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        head_sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        p_ok = subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-101"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_ok.returncode, 0, p_ok.stdout + p_ok.stderr)
+        vres_path = repo / ".sdlc/changes/PROJ-101/verify-result.json"
+        self.assertTrue(vres_path.is_file())
+        vres = json.loads(vres_path.read_text(encoding="utf-8"))
+        self.assertTrue(vres["passed"])
+        self.assertEqual(vres["head_commit"], head_sha)
+        self.assertTrue(vres["tree_digest"])
+        self.assertEqual(len(vres["tree_digest"]), 64)
+        self.assertEqual(vres["results"][0]["exit_code"], 0)
+
+        # 2. Failing verify command writes passed: false and exits non-zero
+        cfg_fail = dict(cfg_pass)
+        cfg_fail["gated_paths"] = [
+            {
+                "pattern": "services/**",
+                "verify": [f"{sys.executable} -c 'import sys; sys.exit(2)'"],
+                "cwd": ".",
+            }
+        ]
+        (repo / "verigate.json").write_text(json.dumps(cfg_fail, indent=2) + "\n", encoding="utf-8")
+        p_fail = subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-101"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_fail.returncode, 0)
+        vres_fail = json.loads(vres_path.read_text(encoding="utf-8"))
+        self.assertFalse(vres_fail["passed"])
+        self.assertEqual(vres_fail["results"][0]["exit_code"], 2)
+
+        # 3. Missing binary FAILS when fail_on_missing_tool: true
+        cfg_miss_fail = {
+            "version": "3.0.0",
+            "fail_on_missing_tool": True,
+            "gated_paths": [
+                {
+                    "pattern": "services/**",
+                    "verify": ["nonexistent_tool_xyz --check"],
+                    "cwd": ".",
+                }
+            ],
+        }
+        (repo / "verigate.json").write_text(json.dumps(cfg_miss_fail, indent=2) + "\n", encoding="utf-8")
+        p_mf = subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-101"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_mf.returncode, 0)
+        vres_mf = json.loads(vres_path.read_text(encoding="utf-8"))
+        self.assertFalse(vres_mf["passed"])
+        self.assertTrue(vres_mf["results"][0]["missing_tool"])
+
+        # 4. Missing binary PASSES / SKIPS when fail_on_missing_tool: false
+        cfg_miss_skip = dict(cfg_miss_fail, fail_on_missing_tool=False)
+        (repo / "verigate.json").write_text(json.dumps(cfg_miss_skip, indent=2) + "\n", encoding="utf-8")
+        p_ms = subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-101"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_ms.returncode, 0, p_ms.stdout + p_ms.stderr)
+        vres_ms = json.loads(vres_path.read_text(encoding="utf-8"))
+        self.assertTrue(vres_ms["passed"])
+        self.assertTrue(vres_ms["results"][0]["missing_tool"])
+        self.assertTrue(vres_ms["results"][0]["skipped_missing_tool"])
+
+    def test_v30_required_change_folder_and_git_pre_commit_pre_push(self) -> None:
+        cfg = {
+            "version": "3.0.0",
+            "require_spec_approval": True,
+            "require_change_folder_for_gated_paths": True,
+            "fail_on_missing_tool": True,
+            "gated_paths": [
+                {
+                    "pattern": "services/**",
+                    "verify": [f"{sys.executable} -c 'import sys; sys.exit(0)'"],
+                    "cwd": ".",
+                }
+            ],
+        }
+        repo, vbin = self._init_v3_repo("v3-hooks", cfg)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/PROJ-202-api"], check=True, capture_output=True)
+
+        # Touching services/api.py without .sdlc/changes/PROJ-202/ fails git-pre-commit
+        (repo / "services").mkdir()
+        (repo / "services/api.py").write_text("def v1(): return 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "services/api.py"], check=True)
+        p_pc_fail = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-commit"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_pc_fail.returncode, 0)
+
+        # Create approved change folder .sdlc/changes/PROJ-202/ -> git-pre-commit PASSES
+        cdir = repo / ".sdlc/changes/PROJ-202"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "intent.md").write_text(VALID_INTENT_MD, encoding="utf-8")
+        (cdir / "spec.md").write_text(VALID_SPEC_MD, encoding="utf-8")
+        subprocess.run(
+            [sys.executable, str(vbin), "approve", "--project", str(repo), "--change", "PROJ-202", "--stage", "S1_S2"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        subprocess.run(["git", "-C", str(repo), "add", ".sdlc/changes/PROJ-202", "services/api.py"], check=True)
+        p_pc_ok = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-commit"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_pc_ok.returncode, 0, p_pc_ok.stderr)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "feat: add services api"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+
+        # git-pre-push BLOCKS when verify-result.json is missing
+        p_pp_missing = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-push"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_pp_missing.returncode, 0)
+        self.assertIn("Missing", p_pp_missing.stderr)
+
+        # Run verigate verify on current HEAD -> git-pre-push PASSES
+        subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-202"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        p_pp_ok = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-push"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_pp_ok.returncode, 0, p_pp_ok.stderr)
+
+        # Modifying a gated file invalidates tree_digest -> git-pre-push BLOCKS
+        (repo / "services/api.py").write_text("def v1(): return 2\n", encoding="utf-8")
+        p_pp_digest = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-push"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_pp_digest.returncode, 0)
+        self.assertIn("digest mismatch", p_pp_digest.stderr)
+
+        # Committing the change invalidates head_commit -> git-pre-push BLOCKS until re-verified
+        subprocess.run(["git", "-C", str(repo), "add", "services/api.py"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "feat: update api return value"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        p_pp_stale = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-push"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_pp_stale.returncode, 0)
+        self.assertIn("Stale", p_pp_stale.stderr)
+
+        # Re-running verify on new HEAD -> git-pre-push PASSES again
+        subprocess.run(
+            [sys.executable, str(vbin), "verify", "--project", str(repo), "--change", "PROJ-202"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        p_pp_ok2 = subprocess.run(
+            [sys.executable, str(vbin), "hook", "--adapter", "git-pre-push"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_pp_ok2.returncode, 0, p_pp_ok2.stderr)
+
+    def test_v30_ci_check_recomputes_from_scratch_ignores_forged_verify_result(self) -> None:
+        cfg = {
+            "version": "3.0.0",
+            "require_spec_approval": True,
+            "require_change_folder_for_gated_paths": True,
+            "fail_on_missing_tool": True,
+            "gated_paths": [
+                {
+                    "pattern": "services/**",
+                    "verify": [f"{sys.executable} -m unittest discover -s tests"],
+                    "cwd": ".",
+                }
+            ],
+        }
+        repo, vbin = self._init_v3_repo("v3-cicheck", cfg)
+
+        # Branch off main for a PR
+        subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/PROJ-303-ci"], check=True, capture_output=True)
+        (repo / "services").mkdir()
+        (repo / "tests").mkdir()
+        (repo / "services/api.py").write_text("def compute():\n    return 0\n", encoding="utf-8")
+        (repo / "tests/test_api.py").write_text(
+            "import unittest\n"
+            "from services.api import compute\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_compute(self):\n"
+            "        self.assertEqual(compute(), 42)\n",
+            encoding="utf-8",
+        )
+
+        cdir = repo / ".sdlc/changes/PROJ-303"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "intent.md").write_text(VALID_INTENT_MD, encoding="utf-8")
+        (cdir / "spec.md").write_text(VALID_SPEC_MD, encoding="utf-8")
+        subprocess.run(
+            [sys.executable, str(vbin), "approve", "--project", str(repo), "--change", "PROJ-303", "--stage", "S1_S2"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+
+        # Forge a laptop verify-result.json claiming passed: true!
+        (cdir / "verify-result.json").write_text(
+            json.dumps({"passed": True, "head_commit": "forged", "tree_digest": "forged", "results": []}, indent=2),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--no-verify", "-m", "feat: failing code with forged verify-result"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+
+        # ci-check MUST ignore forged verify-result.json, recompute tests, and FAIL!
+        p_ci_fail = subprocess.run(
+            [sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_ci_fail.returncode, 0)
+        d_fail = json.loads(p_ci_fail.stdout)
+        self.assertEqual(d_fail["status"], "FAILED")
+        self.assertFalse(d_fail["trusted_laptop_verify_result"])
+        self.assertTrue(d_fail["checks"]["verify"]["recomputed"])
+        self.assertFalse(d_fail["checks"]["verify"]["passed"])
+
+        # Fix the actual code so the test passes -> ci-check PASSES!
+        (repo / "services/api.py").write_text("def compute():\n    return 42\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "services/api.py"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "fix: return 42"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        p_ci_ok = subprocess.run(
+            [sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_ci_ok.returncode, 0, p_ci_ok.stdout + p_ci_ok.stderr)
+        d_ok = json.loads(p_ci_ok.stdout)
+        self.assertEqual(d_ok["status"], "PASSED")
+        self.assertFalse(d_ok["trusted_laptop_verify_result"])
+        self.assertTrue(d_ok["checks"]["verify"]["recomputed"])
+        self.assertTrue(d_ok["checks"]["verify"]["passed"])
+        self.assertTrue(d_ok["checks"]["change_folder"]["passed"])
+
+    def test_v30_pinned_release_ci_templates_and_pre_push_install(self) -> None:
+        pin_repo = self.tmp_dir / "v3-pinned-install"
+        pin_repo.mkdir()
+        p_inst = subprocess.run(
+            [
+                sys.executable,
+                str(KIT_ROOT / "install_verigate.py"),
+                "--target",
+                str(pin_repo),
+                "--targets",
+                "git,ci",
+                "--verigate-ref",
+                "v3.0.1-rc1",
+                "--verigate-repo",
+                "https://example.com/org/verigate-sdlc.git",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        inst_out = json.loads(p_inst.stdout)
+        self.assertEqual(inst_out["verigate_ref"], "v3.0.1-rc1")
+        self.assertEqual(inst_out["verigate_repo"], "https://example.com/org/verigate-sdlc.git")
+
+        # Both .githooks/pre-commit and .githooks/pre-push installed and executable
+        pre_commit = pin_repo / ".githooks/pre-commit"
+        pre_push = pin_repo / ".githooks/pre-push"
+        self.assertTrue(pre_commit.is_file())
+        self.assertTrue(pre_push.is_file())
+        self.assertIn("git-pre-commit", pre_commit.read_text(encoding="utf-8"))
+        self.assertIn("git-pre-push", pre_push.read_text(encoding="utf-8"))
+        if os.name != "nt":
+            self.assertTrue(os.access(pre_push, os.X_OK))
+
+        # Both CI templates check out pinned VERIGATE_REF and invoke ci-check (never PR-branch .sdlc/bin/verigate.py)
+        gh_yml = (pin_repo / ".github/workflows/verigate-gate.yml").read_text(encoding="utf-8")
+        az_yml = (pin_repo / "azure-pipelines.yml").read_text(encoding="utf-8")
+        for name, yml in (("github", gh_yml), ("azure", az_yml)):
+            self.assertIn("VERIGATE_REF", yml, f"{name} missing VERIGATE_REF")
+            self.assertIn("v3.0.1-rc1", yml, f"{name} missing custom pinned ref")
+            self.assertIn("https://example.com/org/verigate-sdlc.git", yml, f"{name} missing custom repo")
+            self.assertIn("ci-check --project . --base", yml, f"{name} must invoke ci-check")
+            self.assertNotIn(".sdlc/bin/verigate.py", yml, f"{name} must NOT run PR-branch .sdlc/bin/verigate.py")
+
+    def test_v30_readme_tool_agnostic_positioning(self) -> None:
+        readme = (KIT_ROOT / "README.md").read_text(encoding="utf-8")
+        lower = readme.lower()
+
+        # Leads with tool-agnostic Git commit/push + PR pipeline gating BEFORE optional AI hooks
+        idx_lead = lower.find("gates at git commit/push and the pr pipeline")
+        idx_hooks = lower.find("## optional early-feedback adapters")
+        self.assertNotEqual(idx_lead, -1, "README must lead with Git commit/push + PR pipeline gating")
+        self.assertNotEqual(idx_hooks, -1, "README must frame AI hooks as Optional Early-Feedback Adapters")
+        self.assertLess(idx_lead, idx_hooks, "Tool-agnostic Git/PR positioning must come before AI hooks section")
+
+        # Covers all v3.0 core pillars
+        for token in (
+            "verigate verify",
+            "verigate ci-check",
+            "VERIGATE_REF",
+            "gated_paths",
+            "fail_on_missing_tool",
+            "verify-result.json",
+            "head_commit",
+            "tree_digest",
+            "CODEOWNERS",
+            ".sdlc/changes/**",
+            "[VeriGate Guide Rail — Not a crash]",
+        ):
+            self.assertIn(token, readme, f"README.md missing v3.0 pillar token: {token}")
 
 
 if __name__ == "__main__":

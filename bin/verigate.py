@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 MAX_STOP_INTERCEPTS = 1
@@ -61,14 +62,33 @@ PROTECTED_LEDGER_RE = re.compile(
     re.IGNORECASE,
 )
 GOVERNANCE_RE = re.compile(
-    r"(^|/)(REVIEW\.md|\.sdlc/(REVIEW\.md|config\.json|policy\.json|active-change)|\.claude/settings.*\.json|\.agents/hooks\.json|\.gemini/settings\.json|\.githooks/[^/]+|\.github/workflows/[^/]+\.ya?ml|azure-pipelines.*\.ya?ml)$",
+    r"(^|/)(REVIEW\.md|verigate\.json|\.sdlc/(REVIEW\.md|config\.json|policy\.json|active-change)|\.claude/settings.*\.json|\.agents/hooks\.json|\.gemini/settings\.json|\.githooks/[^/]+|\.github/workflows/[^/]+\.ya?ml|azure-pipelines.*\.ya?ml)$",
     re.IGNORECASE,
 )
 SANCTIONED_GATE_CMD_RE = re.compile(
-    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check)\b(.*)$'
+    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check|verify|ci-check)\b(.*)$'
+)
+SANCTIONED_BRIDGE_CMD_RE = re.compile(
+    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?issue_bridge\.py"|\'[^\']*?issue_bridge\.py\'|\S*?issue_bridge\.py)\s+(detect|preview|create)\b(.*)$'
 )
 SHELL_CHAIN_OR_REDIRECT_RE = re.compile(r"[;&|`$><\n]")
 ANY_VERIGATE_INVOCATION_RE = re.compile(r"(^|[\s/\"'\\])verigate\.py\b", re.IGNORECASE)
+ANY_BRIDGE_INVOCATION_RE = re.compile(r"(^|[\s/\"'\\])issue_bridge\.py\b", re.IGNORECASE)
+READONLY_SHELL_PROGS = {
+    "ls",
+    "dir",
+    "cat",
+    "type",
+    "head",
+    "tail",
+    "wc",
+    "stat",
+    "get-childitem",
+    "get-content",
+    "test-path",
+    "gci",
+    "gc",
+}
 GIT_NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b.*(?:\s--no-verify\b|\s-[a-zA-Z]*n\b)")
 SHELL_SECRET_WRITE_RE = re.compile(
     r"(?:>|>>|\btee\b|\bcp\b|\bmv\b|\bsed\s+-i|\bperl\s+-[a-zA-Z]*i|"
@@ -257,6 +277,317 @@ def is_meta_or_doc_path(path_str: str) -> bool:
     }
 
 
+DEFAULT_BRANCH_PATTERN = r"([A-Z][A-Z0-9]{1,10}-\d+)"
+TREE_SKIP_DIRS = {".git", ".sdlc", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+
+
+def load_config(project_root: str) -> dict:
+    """Load declarative per-repo config from `.sdlc/config.json` with repo-root `verigate.json` override."""
+    abs_root = os.path.realpath(project_root)
+    raw: dict = {}
+    for cfg_path in (
+        os.path.join(abs_root, ".sdlc", "config.json"),
+        os.path.join(abs_root, "verigate.json"),
+    ):
+        if os.path.isfile(cfg_path):
+            try:
+                loaded = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw.update(loaded)
+            except Exception:
+                pass
+
+    gated_paths_raw = raw.get("gated_paths")
+    gated_paths: list[dict] = []
+    if isinstance(gated_paths_raw, list):
+        for item in gated_paths_raw:
+            if isinstance(item, dict) and item.get("pattern"):
+                verify_cmds = item.get("verify") or []
+                if isinstance(verify_cmds, str):
+                    verify_cmds = [verify_cmds]
+                gated_paths.append(
+                    {
+                        "pattern": str(item["pattern"]),
+                        "verify": [str(c) for c in verify_cmds if str(c).strip()],
+                        "cwd": str(item.get("cwd") or "."),
+                    }
+                )
+
+    terraform_dirs_raw = raw.get("terraform_dirs")
+    terraform_dirs = (
+        [str(d) for d in terraform_dirs_raw if str(d).strip()]
+        if isinstance(terraform_dirs_raw, list)
+        else []
+    )
+
+    require_spec = bool(raw.get("require_spec_approval", False))
+    if "require_change_folder_for_gated_paths" in raw:
+        require_change_folder = bool(raw.get("require_change_folder_for_gated_paths"))
+    else:
+        require_change_folder = bool(gated_paths or require_spec)
+
+    fail_on_missing_tool = bool(raw.get("fail_on_missing_tool", True))
+
+    change_id_raw = raw.get("change_id") if isinstance(raw.get("change_id"), dict) else {}
+    change_id_cfg = {
+        "branch_pattern": str(change_id_raw.get("branch_pattern") or DEFAULT_BRANCH_PATTERN),
+    }
+
+    approvers_raw = raw.get("approvers") if isinstance(raw.get("approvers"), dict) else {}
+    approvers_cfg = {
+        "codeowners_paths": list(approvers_raw.get("codeowners_paths") or [".sdlc/changes/**"]),
+        "required_reviewers": list(approvers_raw.get("required_reviewers") or []),
+    }
+
+    tracker_raw = raw.get("tracker") if isinstance(raw.get("tracker"), dict) else {}
+    tracker_cfg = {
+        "provider": str(tracker_raw.get("provider") or "auto"),
+        "min_severity": str(tracker_raw.get("min_severity") or "High"),
+    }
+
+    return {
+        "version": str(raw.get("version") or "3.0.0"),
+        "require_spec_approval": require_spec,
+        "require_change_folder_for_gated_paths": require_change_folder,
+        "fail_on_missing_tool": fail_on_missing_tool,
+        "change_id": change_id_cfg,
+        "gated_paths": gated_paths,
+        "approvers": approvers_cfg,
+        "tracker": tracker_cfg,
+        "terraform_dirs": terraform_dirs,
+    }
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    pat = pattern.replace("\\", "/").lstrip("/")
+    while pat.startswith("./"):
+        pat = pat[2:]
+    i = 0
+    n = len(pat)
+    res: list[str] = ["^"]
+    while i < n:
+        ch = pat[i]
+        if ch == "*":
+            if i + 1 < n and pat[i + 1] == "*":
+                while i + 1 < n and pat[i + 1] == "*":
+                    i += 1
+                if i + 1 < n and pat[i + 1] == "/":
+                    res.append("(?:.+/)?")
+                    i += 2
+                    continue
+                res.append(".*")
+                i += 1
+                continue
+            res.append("[^/]*")
+            i += 1
+        elif ch == "?":
+            res.append("[^/]")
+            i += 1
+        else:
+            res.append(re.escape(ch))
+            i += 1
+    res.append("$")
+    return re.compile("".join(res))
+
+
+def _normalize_rel_path(path_str: str, project_root: str | None = None) -> str:
+    p = path_str.replace("\\", "/")
+    if project_root and os.path.isabs(path_str):
+        try:
+            abs_root = os.path.realpath(project_root)
+            abs_p = os.path.realpath(path_str)
+            rel = os.path.relpath(abs_p, abs_root).replace("\\", "/")
+            if not rel.startswith("../") and rel != "..":
+                p = rel
+        except ValueError:
+            pass
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
+def path_matches_glob(rel_path: str, pattern: str) -> bool:
+    """Pure-Python glob matcher supporting `**`, `*`, `?` on forward-slash normalized paths."""
+    if not rel_path or not pattern:
+        return False
+    norm_path = _normalize_rel_path(rel_path)
+    return bool(_glob_to_regex(pattern).match(norm_path))
+
+
+def get_effective_gated_rules(config: dict) -> list[dict]:
+    rules = list(config.get("gated_paths") or [])
+    if not rules:
+        for tf_dir in config.get("terraform_dirs") or []:
+            clean_dir = str(tf_dir).replace("\\", "/").strip("/")
+            pat = f"{clean_dir}/**" if clean_dir and clean_dir != "." else "**/*.tf"
+            rules.append(
+                {
+                    "pattern": pat,
+                    "verify": ["terraform fmt -check -recursive", "terraform validate"],
+                    "cwd": clean_dir or ".",
+                }
+            )
+    return rules
+
+
+def is_path_gated(rel_path: str, config: dict) -> bool:
+    norm = _normalize_rel_path(rel_path)
+    if not norm or is_meta_or_doc_path(norm) or norm == "verigate.json":
+        return False
+    rules = get_effective_gated_rules(config)
+    if rules:
+        return any(path_matches_glob(norm, r["pattern"]) for r in rules)
+    return True
+
+
+def matched_gated_rules(rel_paths: list[str] | None, config: dict) -> list[dict]:
+    rules = get_effective_gated_rules(config)
+    if rel_paths is None:
+        return rules
+    norm_paths = [_normalize_rel_path(p) for p in rel_paths if p]
+    return [
+        r
+        for r in rules
+        if any(
+            not is_meta_or_doc_path(p) and path_matches_glob(p, r["pattern"])
+            for p in norm_paths
+        )
+    ]
+
+
+def collect_gated_files(project_root: str, config: dict) -> list[str]:
+    abs_root = os.path.realpath(project_root)
+    gated: list[str] = []
+    for root, dirs, files in os.walk(abs_root):
+        dirs[:] = sorted(d for d in dirs if d not in TREE_SKIP_DIRS)
+        for fname in sorted(files):
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, abs_root).replace("\\", "/")
+            if is_path_gated(rel, config):
+                gated.append(rel)
+    gated.sort()
+    return gated
+
+
+def _git_head_commit(project_root: str) -> str:
+    abs_root = os.path.realpath(project_root)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", abs_root, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return "UNCOMMITTED"
+
+
+def compute_tree_digest(project_root: str, config: dict, target_files: list[str] | None = None) -> str:
+    abs_root = os.path.realpath(project_root)
+    if target_files is not None:
+        rel_paths = sorted({_normalize_rel_path(f, abs_root) for f in target_files if f})
+    else:
+        rel_paths = collect_gated_files(abs_root, config)
+    h = hashlib.sha256()
+    for rel in rel_paths:
+        full = os.path.join(abs_root, rel)
+        d = file_sha256(full) or "MISSING"
+        h.update(f"{rel}:{d}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def run_verify_rules(project_root: str, rules: list[dict], fail_on_missing_tool: bool) -> tuple[bool, list[dict]]:
+    """Execute configured verify commands directly with shell=False and real OS exit codes."""
+    abs_root = os.path.realpath(project_root)
+    results: list[dict] = []
+    for rule in rules:
+        pattern = str(rule.get("pattern") or "**")
+        cwd_rel = str(rule.get("cwd") or ".")
+        rule_cwd = os.path.realpath(os.path.join(abs_root, cwd_rel))
+        cmds = rule.get("verify") or []
+        if isinstance(cmds, str):
+            cmds = [cmds]
+        for cmd in cmds:
+            cmd_str = str(cmd).strip()
+            if not cmd_str:
+                continue
+            try:
+                argv = shlex.split(cmd_str)
+            except ValueError as exc:
+                results.append(
+                    {
+                        "pattern": pattern,
+                        "command": cmd_str,
+                        "cwd": cwd_rel,
+                        "exit_code": 2,
+                        "missing_tool": False,
+                        "skipped_missing_tool": False,
+                        "passed": False,
+                        "duration_ms": 0,
+                        "stdout_tail": "",
+                        "stderr_tail": f"Invalid command syntax: {exc}",
+                    }
+                )
+                continue
+            if not argv:
+                continue
+            t0 = time.monotonic()
+            missing_tool = False
+            skipped_missing_tool = False
+            if not os.path.isdir(rule_cwd):
+                exit_code = 1
+                stdout_tail = ""
+                stderr_tail = f"Working directory not found: {rule_cwd}"
+                passed = False
+            else:
+                try:
+                    proc = subprocess.run(
+                        argv,
+                        shell=False,
+                        cwd=rule_cwd,
+                        capture_output=True,
+                        text=True,
+                    )
+                    exit_code = proc.returncode
+                    stdout_tail = (proc.stdout or "")[-2000:]
+                    stderr_tail = (proc.stderr or "")[-2000:]
+                    if exit_code == 127:
+                        missing_tool = True
+                except FileNotFoundError:
+                    exit_code = 127
+                    missing_tool = True
+                    stdout_tail = ""
+                    stderr_tail = f"Command not found: {argv[0]}"
+                if missing_tool:
+                    if fail_on_missing_tool:
+                        passed = False
+                    else:
+                        passed = True
+                        skipped_missing_tool = True
+                else:
+                    passed = exit_code == 0
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            results.append(
+                {
+                    "pattern": pattern,
+                    "command": cmd_str,
+                    "cwd": cwd_rel,
+                    "exit_code": exit_code,
+                    "missing_tool": missing_tool,
+                    "skipped_missing_tool": skipped_missing_tool,
+                    "passed": passed,
+                    "duration_ms": duration_ms,
+                    "stdout_tail": stdout_tail,
+                    "stderr_tail": stderr_tail,
+                }
+            )
+    all_passed = all(r["passed"] for r in results)
+    return all_passed, results
+
+
 def sanitize_change_id(raw: str | None, strict: bool = True) -> str | None:
     if not raw:
         return None
@@ -270,7 +601,7 @@ def sanitize_change_id(raw: str | None, strict: bool = True) -> str | None:
     return val
 
 
-def _branch_ticket_id(project_root: str) -> str | None:
+def _branch_ticket_id(project_root: str, config: dict | None = None) -> str | None:
     root = os.path.realpath(project_root)
     branch = ""
     for git_args in (
@@ -286,6 +617,17 @@ def _branch_ticket_id(project_root: str) -> str | None:
             continue
     if not branch or branch in ("main", "master", "HEAD"):
         return None
+    cfg = config if config is not None else load_config(root)
+    pat = ((cfg.get("change_id") or {}).get("branch_pattern") or "").strip()
+    if pat and pat != DEFAULT_BRANCH_PATTERN:
+        try:
+            m = re.search(pat, branch)
+            if m:
+                raw_id = m.group(1) if m.lastindex else m.group(0)
+                return sanitize_change_id(raw_id, strict=False)
+            return None
+        except re.error:
+            pass
     m = BRANCH_TICKET_RE.search(branch)
     if m:
         return sanitize_change_id(m.group(1), strict=False)
@@ -318,6 +660,56 @@ def resolve_artifact_dir(project_root: str, change_id: str | None = None, strict
         abs_dir = os.path.join(abs_root, ".sdlc", "changes", cid)
         return abs_dir, rel_dir, cid
     return os.path.join(abs_root, ".sdlc"), ".sdlc", None
+
+
+def check_required_change_folder(
+    project_root: str,
+    touched_rel_paths: list[str],
+    config: dict,
+    change_id: str | None = None,
+) -> tuple[bool, str]:
+    """Fail closed when gated paths are modified without an active `.sdlc/changes/<id>/{intent.md,spec.md}`."""
+    abs_root = os.path.realpath(project_root)
+    norm_paths = [_normalize_rel_path(p, abs_root) for p in touched_rel_paths if p]
+    gated_touched = [p for p in norm_paths if is_path_gated(p, config)]
+    if not gated_touched:
+        return True, "No gated paths touched."
+    if not config.get("require_change_folder_for_gated_paths", False):
+        return True, "Change folder not required by config."
+
+    cid = resolve_change_id(abs_root, change_id)
+    has_explicit_gated_rules = bool(get_effective_gated_rules(config))
+    if not cid and not has_explicit_gated_rules:
+        # Backward compatibility for v2.x root `.sdlc/{intent.md,spec.md}` layout when `gated_paths` is not configured
+        root_intent = os.path.join(abs_root, ".sdlc", "intent.md")
+        root_spec = os.path.join(abs_root, ".sdlc", "spec.md")
+        if os.path.isfile(root_intent) and os.path.isfile(root_spec):
+            return True, "Legacy `.sdlc/{intent.md,spec.md}` present."
+
+    sample = ", ".join(gated_touched[:3])
+    if not cid:
+        pat = ((config.get("change_id") or {}).get("branch_pattern") or DEFAULT_BRANCH_PATTERN)
+        return (
+            False,
+            f"Gated path(s) modified ({sample}) without an active change ID. "
+            f"Use a branch matching `{pat}`, set `.sdlc/active-change`, or pass `--change <ID>` "
+            "and create `.sdlc/changes/<ID>/intent.md` + `spec.md`.",
+        )
+
+    change_dir = os.path.join(abs_root, ".sdlc", "changes", cid)
+    intent_path = os.path.join(change_dir, "intent.md")
+    spec_path = os.path.join(change_dir, "spec.md")
+    if not os.path.isfile(intent_path):
+        return (
+            False,
+            f"Missing required `.sdlc/changes/{cid}/intent.md` for gated path(s) ({sample}).",
+        )
+    if not os.path.isfile(spec_path):
+        return (
+            False,
+            f"Missing required `.sdlc/changes/{cid}/spec.md` for gated path(s) ({sample}).",
+        )
+    return True, f"Change folder `.sdlc/changes/{cid}` verified for gated paths."
 
 
 def _shadow_project_key(abs_root: str, change_id: str | None = None) -> str:
@@ -382,6 +774,7 @@ def verify_stage_approval(
     stage_key: str,
     rel_artifact: str | None = None,
     change_id: str | None = None,
+    prefer_git_head: bool = False,
 ) -> tuple[bool, str]:
     abs_root = os.path.realpath(project_root)
     art_dir, rel_dir, cid = resolve_artifact_dir(abs_root, change_id)
@@ -415,15 +808,18 @@ def verify_stage_approval(
     if not repo_entry:
         return False, f"No approval entry for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve{change_flag}`."
 
-    shadow_key = _shadow_project_key(abs_root, cid)
-    shadow_entry = (
-        (((load_shadow_ledger().get("projects") or {}).get(shadow_key) or {}).get("approvals") or {}).get(stage_key)
-        or {}
-    )
-    trusted_hash = shadow_entry.get("sha256")
-    if not trusted_hash:
-        # On a fresh team clone, git worktree, or CI runner, trust HEAD-committed approvals.json
+    if prefer_git_head:
         trusted_hash = _read_git_head_approval_hash(abs_root, stage_key, rel_approvals)
+    else:
+        shadow_key = _shadow_project_key(abs_root, cid)
+        shadow_entry = (
+            (((load_shadow_ledger().get("projects") or {}).get(shadow_key) or {}).get("approvals") or {}).get(stage_key)
+            or {}
+        )
+        trusted_hash = shadow_entry.get("sha256")
+        if not trusted_hash:
+            # On a fresh team clone, git worktree, or CI runner, trust HEAD-committed approvals.json
+            trusted_hash = _read_git_head_approval_hash(abs_root, stage_key, rel_approvals)
 
     if not trusted_hash:
         return False, f"No verified human approval for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve{change_flag}`."
@@ -475,13 +871,8 @@ def render_dispatch_table(info: dict, rel_dir: str = ".sdlc") -> str:
 def is_spec_lock_active(proj_root: str, session: dict, change_id: str | None = None) -> bool:
     abs_root = os.path.realpath(proj_root)
     art_dir, _rel_dir, _cid = resolve_artifact_dir(abs_root, change_id)
-    cfg_file = os.path.join(abs_root, ".sdlc", "config.json")
-    cfg_enforce = False
-    if os.path.isfile(cfg_file):
-        try:
-            cfg_enforce = bool(json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("require_spec_approval", False))
-        except Exception:
-            pass
+    cfg = load_config(abs_root)
+    cfg_enforce = bool(cfg.get("require_spec_approval", False))
     return (
         bool(session.get("enforceSpec", False))
         or cfg_enforce
@@ -699,16 +1090,44 @@ def _segment_is_test_runner(seg: str) -> bool:
     return False
 
 
+def _is_readonly_shell_command(cmd: str) -> bool:
+    """Return True if every segment is a pure read-only file/dir inspector with no redirections or subshells."""
+    if not cmd or not cmd.strip():
+        return False
+    unquoted = _strip_quoted_strings(cmd)
+    if re.search(r"[|<>`\n]|(?<!&)&(?!&)|\$\(", unquoted):
+        return False
+    if re.search(r"(shadow_ledger\.json|verigate-shadow)", cmd, re.IGNORECASE):
+        return False
+    segs = _split_shell_segments(cmd)
+    if not segs:
+        return False
+    for seg in segs:
+        toks = [_strip_quotes(t) for t in _safe_split(seg, posix=False)]
+        if not toks:
+            return False
+        prog = _normalize_prog_name(toks[0])
+        if prog not in READONLY_SHELL_PROGS:
+            return False
+    return True
+
+
 def is_real_test_runner_command(cmd: str) -> bool:
+    """Return True only for an unchained test runner (or `cd ... && <test-runner>` where the test is final)."""
     if not cmd or not cmd.strip():
         return False
     unquoted = _strip_quoted_strings(cmd)
     if ERROR_SWALLOW_RE.search(unquoted):
         return False
-    for segment in _split_shell_segments(cmd):
-        if _segment_is_test_runner(segment):
-            return True
-    return False
+    # Reject ;, ||, |, newline, or background & (excluding fd redirects like 2>&1 and &&)
+    no_fd_redir = re.sub(r"[012&]>&[012]", "", unquoted)
+    if re.search(r"[;|\n]|(?<!&)&(?!&)", no_fd_redir):
+        return False
+    segments = _split_shell_segments(cmd)
+    if not segments:
+        return False
+    # The final command MUST be the test runner so no trailing command can mask a non-zero exit code
+    return _segment_is_test_runner(segments[-1])
 
 
 def _strip_quotes(token: str) -> str:
@@ -966,6 +1385,17 @@ def evaluate_file_write(
         return "allow", ""
 
     proj_root = resolve_project_root(full_path, cwd)
+    config = load_config(proj_root)
+    rel_path = _normalize_rel_path(full_path, proj_root)
+    rules = get_effective_gated_rules(config)
+    if rules:
+        if not any(path_matches_glob(rel_path, r["pattern"]) for r in rules):
+            return "allow", ""
+        if config.get("require_change_folder_for_gated_paths", False):
+            ok_cf, msg_cf = check_required_change_folder(proj_root, [rel_path], config, change_id=change_id)
+            if not ok_cf:
+                return "deny", f"[VeriGate Change Folder Gate] Blocked `{base}`: {msg_cf}"
+
     if is_spec_lock_active(proj_root, session, change_id):
         _art_dir, rel_dir, cid = resolve_artifact_dir(proj_root, change_id)
         ok1, m1 = verify_stage_approval(proj_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
@@ -995,18 +1425,34 @@ def evaluate_shell_command(
         m = SANCTIONED_GATE_CMD_RE.match(cmd)
         if m:
             subcmd = m.group(1)
-            if subcmd in ("status", "validate", "dispatch", "merge-check"):
+            if subcmd in ("status", "validate", "dispatch", "merge-check", "verify", "ci-check"):
                 return "allow", ""
             if subcmd == "approve":
                 return "force_ask", "[VeriGate Approval Gate] Confirm human review of intent & spec SHA-256 digests."
             if subcmd == "waive":
                 return "force_ask", "[VeriGate Waiver Gate] Confirm recording a logged Stage Waiver in `waivers.jsonl`."
+        mb = SANCTIONED_BRIDGE_CMD_RE.match(cmd)
+        if mb:
+            subcmd = mb.group(1)
+            if subcmd in ("detect", "preview"):
+                return "allow", ""
+            if subcmd == "create":
+                return "force_ask", "[VeriGate External Gate] Confirm creating GitHub Issues / Azure DevOps Work Items via `issue_bridge.py`."
 
     if ANY_VERIGATE_INVOCATION_RE.search(cmd):
         return (
             "deny",
-            "[VeriGate Integrity Gate] Invoking `verigate.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python3 .sdlc/bin/verigate.py <status|validate|approve|waive|dispatch>`.",
+            "[VeriGate Integrity Gate] Invoking `verigate.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python3 .sdlc/bin/verigate.py <status|validate|approve|waive|dispatch|verify|ci-check>`.",
         )
+
+    if ANY_BRIDGE_INVOCATION_RE.search(cmd):
+        return (
+            "deny",
+            "[VeriGate Integrity Gate] Invoking `issue_bridge.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python3 .sdlc/bin/issue_bridge.py <detect|preview|create>`.",
+        )
+
+    if _is_readonly_shell_command(cmd):
+        return "allow", ""
 
     if LEDGER_TAMPER_CMD_RE.search(cmd):
         return "deny", "[VeriGate Integrity Gate] Direct shell access to `.sdlc` ledgers or hook configs is forbidden."
@@ -1042,7 +1488,21 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
     cfg = sdlc / "config.json"
     if not cfg.exists():
         cfg.write_text(
-            json.dumps({"require_spec_approval": require_spec, "version": "2.4.0", "terraform_dirs": []}, indent=2) + "\n",
+            json.dumps(
+                {
+                    "version": "3.0.0",
+                    "require_spec_approval": require_spec,
+                    "require_change_folder_for_gated_paths": require_spec,
+                    "fail_on_missing_tool": True,
+                    "change_id": {"branch_pattern": DEFAULT_BRANCH_PATTERN},
+                    "gated_paths": [],
+                    "approvers": {"codeowners_paths": [".sdlc/changes/**"], "required_reviewers": []},
+                    "tracker": {"provider": "auto", "min_severity": "High"},
+                    "terraform_dirs": [],
+                },
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
     policy = sdlc / "policy.json"
@@ -1084,10 +1544,14 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
     return 0
 
 
-def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
-    """Deterministic Consistency & Policy Check: Review (0 open findings) + Spec SHA-256 digest consistency -> Ready to Merge."""
+def _evaluate_merge_policy(
+    project_root: str,
+    change_id: str | None = None,
+    prefer_git_head: bool = False,
+) -> tuple[bool, dict]:
+    """Evaluate review policy and spec SHA-256 digest consistency without side-effect printing."""
     sdlc = Path(project_root) / ".sdlc"
-    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=bool(change_id))
     art_dir = Path(art_dir_str)
     policy_file = sdlc / "policy.json"
     policy = {
@@ -1106,10 +1570,14 @@ def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
     reasons: list[str] = []
 
     if (art_dir / "intent.md").is_file():
-        ok1, m1 = verify_stage_approval(project_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
+        ok1, m1 = verify_stage_approval(
+            project_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid, prefer_git_head=prefer_git_head
+        )
         if not ok1:
             reasons.append(f"S1_PLAN: {m1}")
-        ok2, m2 = verify_stage_approval(project_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
+        ok2, m2 = verify_stage_approval(
+            project_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid, prefer_git_head=prefer_git_head
+        )
         if not ok2:
             reasons.append(f"S2_DESIGN: {m2}")
 
@@ -1125,7 +1593,11 @@ def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
             verdict = str(report.get("verdict") or "UNKNOWN").upper()
             score = int(report.get("quality_score") or 0)
             findings = report.get("findings") or []
-            open_findings = [f for f in findings if str(f.get("status") or "open").lower() not in ("fixed", "resolved", "closed", "fixed_verified")]
+            open_findings = [
+                f
+                for f in findings
+                if str(f.get("status") or "open").lower() not in ("fixed", "resolved", "closed", "fixed_verified")
+            ]
             open_count = len(open_findings)
             crit_count = sum(1 for f in open_findings if str(f.get("severity") or "").lower() == "critical")
             high_count = sum(1 for f in open_findings if str(f.get("severity") or "").lower() == "high")
@@ -1133,24 +1605,23 @@ def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
             if verdict != "APPROVE":
                 reasons.append(f"Review verdict is `{verdict}` (must be `APPROVE`).")
             if policy.get("require_zero_findings", True) and open_count > 0:
-                reasons.append(f"{open_count} open review finding(s) remain (team policy requires 0 open findings — run Review <-> Fix cycle).")
+                reasons.append(
+                    f"{open_count} open review finding(s) remain (team policy requires 0 open findings — run Review <-> Fix cycle)."
+                )
             if crit_count > int(policy.get("max_open_critical", 0)):
                 reasons.append(f"{crit_count} open Critical finding(s) exceed policy limit.")
             if high_count > int(policy.get("max_open_high", 0)):
                 reasons.append(f"{high_count} open High finding(s) exceed policy limit.")
             if score < int(policy.get("min_quality_score", 85)):
-                reasons.append(f"Quality score {score} is below team policy minimum ({policy.get('min_quality_score', 85)}).")
+                reasons.append(
+                    f"Quality score {score} is below team policy minimum ({policy.get('min_quality_score', 85)})."
+                )
         except Exception as exc:
             reasons.append(f"Invalid `{rel_dir}/review-findings.json`: {exc}")
 
     ready = len(reasons) == 0
     status = "READY_TO_MERGE" if ready else "BLOCKED_BY_POLICY"
-    append_audit(
-        project_root,
-        "MERGE_POLICY_APPROVED" if ready else "MERGE_POLICY_BLOCKED",
-        {"status": status, "change_id": cid, "verdict": verdict, "quality_score": score, "open_findings": open_count, "reasons": reasons},
-    )
-    out = {
+    out: dict = {
         "status": status,
         "ready_to_merge": ready,
         "artifact_dir": rel_dir,
@@ -1163,8 +1634,221 @@ def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
     }
     if cid:
         out["change_id"] = cid
+    return ready, out
+
+
+def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
+    """Deterministic Consistency & Policy Check: Review (0 open findings) + Spec SHA-256 digest consistency -> Ready to Merge."""
+    ready, out = _evaluate_merge_policy(project_root, change_id=change_id, prefer_git_head=False)
+    append_audit(
+        project_root,
+        "MERGE_POLICY_APPROVED" if ready else "MERGE_POLICY_BLOCKED",
+        {
+            "status": out["status"],
+            "change_id": out.get("change_id"),
+            "verdict": out["verdict"],
+            "quality_score": out["quality_score"],
+            "open_findings": out["open_findings"],
+            "reasons": out["blocking_reasons"],
+        },
+    )
     print(json.dumps(out, indent=2))
     return 0 if ready else 1
+
+
+def cmd_verify(project_root: str, change_id: str | None = None, files_arg: str | None = None) -> int:
+    """Execute configured gated_paths verify commands directly (shell=False) and write commit-bound verify-result.json."""
+    abs_root = os.path.realpath(project_root)
+    config = load_config(abs_root)
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(abs_root, change_id, strict=True)
+    art_dir = Path(art_dir_str)
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    target_files: list[str] | None = None
+    if files_arg is not None and files_arg.strip():
+        target_files = [_normalize_rel_path(f.strip(), abs_root) for f in files_arg.split(",") if f.strip()]
+
+    rules = matched_gated_rules(target_files, config)
+    fail_on_missing = bool(config.get("fail_on_missing_tool", True))
+    passed, results = run_verify_rules(abs_root, rules, fail_on_missing)
+    head_commit = _git_head_commit(abs_root)
+    tree_digest = compute_tree_digest(abs_root, config, target_files=target_files)
+
+    payload: dict = {
+        "timestamp": utc_now_iso(),
+        "head_commit": head_commit,
+        "tree_digest": tree_digest,
+        "change_id": cid,
+        "artifact_dir": rel_dir,
+        "passed": passed,
+        "fail_on_missing_tool": fail_on_missing,
+        "results": results,
+    }
+
+    res_file = art_dir / "verify-result.json"
+    tmp = f"{res_file}.tmp"
+    Path(tmp).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, res_file)
+
+    append_audit(
+        abs_root,
+        "VERIFY_PASSED" if passed else "VERIFY_FAILED",
+        {
+            "change_id": cid,
+            "head_commit": head_commit,
+            "tree_digest": tree_digest,
+            "passed": passed,
+            "check_count": len(results),
+        },
+    )
+    print(json.dumps(payload, indent=2))
+    return 0 if passed else 1
+
+
+def _git_diff_pr_files(abs_root: str, base_ref: str) -> list[str]:
+    candidates = [
+        ["git", "-C", abs_root, "diff", "--name-only", f"{base_ref}...HEAD"],
+        ["git", "-C", abs_root, "diff", "--name-only", f"{base_ref}..HEAD"],
+        ["git", "-C", abs_root, "diff", "--name-only", "HEAD~1..HEAD"],
+        ["git", "-C", abs_root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    ]
+    for args in candidates:
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0:
+                return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+        except Exception:
+            continue
+    return []
+
+
+def _infer_change_id_from_paths(rel_paths: list[str]) -> str | None:
+    found: set[str] = set()
+    for p in rel_paths:
+        m = re.match(r"^\.sdlc/changes/([^/]+)/", p.replace("\\", "/"))
+        if m:
+            cid = sanitize_change_id(m.group(1), strict=False)
+            if cid:
+                found.add(cid)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: str | None = None) -> int:
+    """PR pipeline recompute gate: never trusts laptop verify-result.json; recomputes all checks from scratch."""
+    abs_root = os.path.realpath(project_root)
+    config = load_config(abs_root)
+    touched_files = _git_diff_pr_files(abs_root, base_ref)
+    gated_touched = [p for p in touched_files if is_path_gated(p, config)]
+    head_commit = _git_head_commit(abs_root)
+
+    resolved_cid = resolve_change_id(abs_root, change_id, strict=bool(change_id))
+    if not resolved_cid:
+        resolved_cid = _infer_change_id_from_paths(touched_files)
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(abs_root, resolved_cid, strict=False)
+    art_dir = Path(art_dir_str)
+
+    if not gated_touched:
+        out = {
+            "status": "PASSED",
+            "passed": True,
+            "base_ref": base_ref,
+            "head_commit": head_commit,
+            "artifact_dir": rel_dir,
+            "change_id": cid,
+            "touched_files": touched_files,
+            "gated_paths_touched": [],
+            "trusted_laptop_verify_result": False,
+            "checks": {},
+            "blocking_reasons": [],
+            "message": "No gated paths touched; CI gate passed.",
+        }
+        append_audit(abs_root, "CI_CHECK_PASSED", {"change_id": cid, "head_commit": head_commit, "gated_count": 0})
+        print(json.dumps(out, indent=2))
+        return 0
+
+    reasons: list[str] = []
+    checks: dict = {}
+
+    # 1. Required change folder for gated paths
+    ok_cf, msg_cf = check_required_change_folder(abs_root, touched_files, config, change_id=cid)
+    checks["change_folder"] = {"passed": ok_cf, "detail": msg_cf}
+    if not ok_cf:
+        reasons.append(f"CHANGE_FOLDER: {msg_cf}")
+
+    # 2. Validate intent.md + spec.md content & HEAD-committed SHA-256 approvals
+    if ok_cf or (art_dir / "intent.md").is_file() or (art_dir / "spec.md").is_file():
+        ok1, m1 = verify_stage_approval(abs_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid, prefer_git_head=True)
+        checks["S1_PLAN"] = {"passed": ok1, "detail": m1}
+        if not ok1:
+            reasons.append(f"S1_PLAN: {m1}")
+        ok2, m2 = verify_stage_approval(abs_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid, prefer_git_head=True)
+        checks["S2_DESIGN"] = {"passed": ok2, "detail": m2}
+        if not ok2:
+            reasons.append(f"S2_DESIGN: {m2}")
+
+    # 3. Recompute all matching verify commands from scratch (NEVER trust laptop verify-result.json)
+    rules = matched_gated_rules(gated_touched, config)
+    fail_on_missing = bool(config.get("fail_on_missing_tool", True))
+    v_passed, v_results = run_verify_rules(abs_root, rules, fail_on_missing)
+    checks["verify"] = {
+        "passed": v_passed,
+        "recomputed": True,
+        "fail_on_missing_tool": fail_on_missing,
+        "results": v_results,
+    }
+    if not v_passed:
+        for r in v_results:
+            if not r["passed"]:
+                if r.get("missing_tool"):
+                    reasons.append(
+                        f"VERIFY_MISSING_TOOL ({r['pattern']}): `{r['command']}` not found (fail_on_missing_tool=true)."
+                    )
+                else:
+                    reasons.append(
+                        f"VERIFY_FAILED ({r['pattern']}): `{r['command']}` exited with code {r['exit_code']}."
+                    )
+
+    # 4. Optional Stage 5 review policy consistency check when review-findings.json exists
+    if (art_dir / "review-findings.json").is_file():
+        m_ready, m_out = _evaluate_merge_policy(abs_root, change_id=cid, prefer_git_head=True)
+        checks["merge_policy"] = {
+            "passed": m_ready,
+            "status": m_out["status"],
+            "verdict": m_out["verdict"],
+            "quality_score": m_out["quality_score"],
+            "open_findings": m_out["open_findings"],
+            "blocking_reasons": m_out["blocking_reasons"],
+        }
+        if not m_ready:
+            for r in m_out["blocking_reasons"]:
+                reasons.append(f"MERGE_POLICY: {r}")
+
+    passed = len(reasons) == 0
+    out = {
+        "status": "PASSED" if passed else "FAILED",
+        "passed": passed,
+        "base_ref": base_ref,
+        "head_commit": head_commit,
+        "artifact_dir": rel_dir,
+        "change_id": cid,
+        "touched_files": touched_files,
+        "gated_paths_touched": gated_touched,
+        "trusted_laptop_verify_result": False,
+        "checks": checks,
+        "blocking_reasons": reasons,
+    }
+    append_audit(
+        abs_root,
+        "CI_CHECK_PASSED" if passed else "CI_CHECK_FAILED",
+        {
+            "change_id": cid,
+            "head_commit": head_commit,
+            "gated_count": len(gated_touched),
+            "reasons": reasons,
+        },
+    )
+    print(json.dumps(out, indent=2))
+    return 0 if passed else 1
 
 
 def cmd_approve(project_root: str, stage: str, approver: str, note: str, change_id: str | None = None) -> int:
@@ -1254,8 +1938,14 @@ def cmd_waive(project_root: str, stage: str, reason: str, change_id: str | None 
 # --- Multi-Harness Hook Protocol Adapter ---
 
 
+TEST_FAILURE_OUTPUT_RE = re.compile(
+    r"(?:FAILED\s*\((?:failures|errors)=|={3,}\s*FAILURES\s*={3,}|test result:\s*FAILED|\bFAIL\t|\b[1-9]\d*\s+failed\b)",
+    re.IGNORECASE,
+)
+
+
 def _response_indicates_failure(tresp: object) -> bool:
-    """Detect non-zero exit codes or errors in dict or string tool_response payloads."""
+    """Detect non-zero exit codes, interruptions, or test failure banners in dict or string tool_response payloads."""
     if isinstance(tresp, dict):
         for key in ("exit_code", "exitCode", "code", "returncode"):
             val = tresp.get(key)
@@ -1267,9 +1957,14 @@ def _response_indicates_failure(tresp: object) -> bool:
                     return True
         if tresp.get("interrupted") or tresp.get("is_error") or tresp.get("isError"):
             return True
+        combined = f"{tresp.get('stdout') or ''}\n{tresp.get('stderr') or ''}"
+        if combined.strip() and TEST_FAILURE_OUTPUT_RE.search(combined):
+            return True
         return False
     if isinstance(tresp, str):
         if re.search(r"\b(?:Exit code|Command exited with code)\s+[1-9]\d*\b", tresp, re.IGNORECASE):
+            return True
+        if TEST_FAILURE_OUTPUT_RE.search(tresp):
             return True
     return False
 
@@ -1308,22 +2003,154 @@ def _log_hook_debug(adapter: str, event: str, payload: dict) -> None:
         pass
 
 
+def _has_valid_waiver(
+    project_root: str,
+    change_id: str | None,
+    stage_names: tuple[str, ...],
+    rel_file_paths: list[str],
+) -> bool:
+    abs_root = os.path.realpath(project_root)
+    art_dir_str, _rel_dir, cid = resolve_artifact_dir(abs_root, change_id)
+    live_digests: dict[str, str] = {}
+    for rel in rel_file_paths:
+        rp = os.path.realpath(os.path.join(abs_root, rel))
+        d = file_sha256(rp)
+        if not d:
+            return False
+        live_digests[rp] = d
+    if not live_digests:
+        return False
+
+    waivers: list[dict] = []
+    projects_sh = load_shadow_ledger().get("projects") or {}
+    waivers.extend(((projects_sh.get(_shadow_project_key(abs_root, cid)) or {}).get("waivers")) or [])
+    if cid:
+        waivers.extend(((projects_sh.get(abs_root) or {}).get("waivers")) or [])
+
+    waivers_file = os.path.join(art_dir_str, "waivers.jsonl")
+    if os.path.isfile(waivers_file):
+        try:
+            for line in Path(waivers_file).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    waivers.append(json.loads(line))
+        except Exception:
+            pass
+
+    return any(
+        w.get("stage") in stage_names
+        and all((w.get("files") or {}).get(fp) == d for fp, d in live_digests.items())
+        for w in waivers
+    )
+
+
+def _git_pre_push_files(proj: str) -> list[str]:
+    for args in (
+        ["git", "-C", proj, "diff", "--name-only", "@{u}..HEAD"],
+        ["git", "-C", proj, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    ):
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0:
+                return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+        except Exception:
+            continue
+    return []
+
+
 def handle_hook(adapter: str, event_override: str | None, change_id: str | None = None) -> int:
     if adapter == "git-pre-commit":
         proj = resolve_project_root(".", os.getcwd())
+        config = load_config(proj)
         proc = subprocess.run(
             ["git", "-C", proj, "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             capture_output=True,
             text=True,
         )
-        staged = [os.path.join(proj, line.strip()) for line in proc.stdout.splitlines() if line.strip()]
-        for sp in staged:
+        staged_rel = [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+        ok_cf, msg_cf = check_required_change_folder(proj, staged_rel, config, change_id=change_id)
+        if not ok_cf:
+            sys.stderr.write(f"\n❌ [VeriGate Change Folder Gate] {msg_cf}\n")
+            return 1
+        for rel in staged_rel:
+            sp = os.path.join(proj, rel)
             if PROTECTED_LEDGER_RE.search(sp.replace("\\", "/")):
                 continue
             decision, reason = evaluate_file_write(sp, {}, proj, change_id=change_id)
             if decision == "deny":
                 sys.stderr.write(f"\n❌ {reason}\n")
                 return 1
+        return 0
+
+    if adapter == "git-pre-push":
+        proj = resolve_project_root(".", os.getcwd())
+        config = load_config(proj)
+        pushed_rel = _git_pre_push_files(proj)
+        gated_pushed = [p for p in pushed_rel if is_path_gated(p, config)]
+        if not gated_pushed:
+            return 0
+
+        ok_cf, msg_cf = check_required_change_folder(proj, pushed_rel, config, change_id=change_id)
+        if not ok_cf:
+            sys.stderr.write(f"\n❌ [VeriGate Pre-Push Gate] {msg_cf}\n")
+            return 1
+
+        art_dir_str, rel_dir, cid = resolve_artifact_dir(proj, change_id)
+        change_flag = f" --change {cid}" if cid else ""
+
+        if is_spec_lock_active(proj, {}, change_id=cid) or os.path.isfile(os.path.join(art_dir_str, "intent.md")):
+            ok1, m1 = verify_stage_approval(proj, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
+            if not ok1:
+                sys.stderr.write(f"\n❌ [VeriGate Pre-Push S1 Gate] {m1}\n")
+                return 1
+            ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
+            if not ok2:
+                sys.stderr.write(f"\n❌ [VeriGate Pre-Push S2 Gate] {m2}\n")
+                return 1
+
+        if _has_valid_waiver(proj, cid, ("ALL", "S4_TEST"), gated_pushed):
+            return 0
+
+        verify_file = os.path.join(art_dir_str, "verify-result.json")
+        if not os.path.isfile(verify_file):
+            sys.stderr.write(
+                f"\n❌ [VeriGate Pre-Push Verify Gate] Missing `{rel_dir}/verify-result.json`. "
+                f"Run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+            )
+            return 1
+        try:
+            vres = json.loads(Path(verify_file).read_text(encoding="utf-8"))
+        except Exception:
+            sys.stderr.write(
+                f"\n❌ [VeriGate Pre-Push Verify Gate] Corrupted `{rel_dir}/verify-result.json`. "
+                f"Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+            )
+            return 1
+
+        if not vres.get("passed"):
+            sys.stderr.write(
+                f"\n❌ [VeriGate Pre-Push Verify Gate] Latest verification in `{rel_dir}/verify-result.json` did not pass. "
+                f"Fix failures and run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+            )
+            return 1
+
+        current_head = _git_head_commit(proj)
+        if vres.get("head_commit") != current_head:
+            sys.stderr.write(
+                f"\n❌ [VeriGate Pre-Push Verify Gate] Stale `{rel_dir}/verify-result.json` "
+                f"(verified `{str(vres.get('head_commit'))[:12]}`, current HEAD `{current_head[:12]}`). "
+                f"Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+            )
+            return 1
+
+        current_digest = compute_tree_digest(proj, config)
+        if vres.get("tree_digest") != current_digest:
+            sys.stderr.write(
+                f"\n❌ [VeriGate Pre-Push Verify Gate] Gated files changed since `{rel_dir}/verify-result.json` was generated "
+                f"(digest mismatch). Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+            )
+            return 1
+
         return 0
 
     raw = sys.stdin.read()
@@ -1501,7 +2328,12 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
                     session["dirtyFiles"] = dirty[-25:]
                     session["verified"] = False
                     session["reviewed"] = False
-            if not wrote_source and dirty and is_real_test_runner_command(cmd_str):
+            is_verigate_verify = (
+                not SHELL_CHAIN_OR_REDIRECT_RE.search(cmd_str)
+                and (m_vg := SANCTIONED_GATE_CMD_RE.match(cmd_str)) is not None
+                and m_vg.group(1) == "verify"
+            )
+            if not wrote_source and (is_verigate_verify or (dirty and is_real_test_runner_command(cmd_str))):
                 session["verified"] = True
         elif not cmd_failed and "reviewer" in sub_agent.lower():
             session["reviewed"] = True
@@ -1558,8 +2390,9 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
             save_session(session_id, session)
             change_flag = f" --change {cid}" if cid else ""
             msg = (
-                "[VeriGate AI-SDLC Stop Gate] Modified source files require S4 Verification (tests) AND S5 Code Review "
-                f"(`{rel_dir}/review-findings.json` + `{rel_dir}/review-report.md`). If blocked by a missing tool/runtime, request a logged waiver: "
+                "[VeriGate Guide Rail — Not a crash] Action needed before finishing: modified source files still need "
+                f"S4 Verification (standalone test run) AND S5 Code Review (`{rel_dir}/review-findings.json` + `{rel_dir}/review-report.md`). "
+                "If blocked by a missing tool/runtime, request a logged waiver: "
                 f'`python3 .sdlc/bin/verigate.py waive --project "{proj}"{change_flag} --stage ALL --reason "<blocker>"`.'
             )
             append_audit(proj, "STOP_GATE_INTERCEPT", {"session_id": session_id, "change_id": cid})
@@ -1617,8 +2450,18 @@ def main() -> None:
     p_merge.add_argument("--project", default=".")
     p_merge.add_argument("--change", default=None)
 
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("--project", default=".")
+    p_verify.add_argument("--change", default=None)
+    p_verify.add_argument("--files", default=None)
+
+    p_ci = sub.add_parser("ci-check")
+    p_ci.add_argument("--project", default=".")
+    p_ci.add_argument("--base", default="origin/main")
+    p_ci.add_argument("--change", default=None)
+
     p_hook = sub.add_parser("hook")
-    p_hook.add_argument("--adapter", choices=["auto", "antigravity", "claude", "git-pre-commit"], default="auto")
+    p_hook.add_argument("--adapter", choices=["auto", "antigravity", "claude", "git-pre-commit", "git-pre-push"], default="auto")
     p_hook.add_argument("--event", default=None)
     p_hook.add_argument("--change", default=None)
 
@@ -1662,6 +2505,10 @@ def main() -> None:
             sys.exit(0)
         if args.cmd == "merge-check":
             sys.exit(cmd_merge_check(os.path.realpath(args.project), change_id=args.change))
+        if args.cmd == "verify":
+            sys.exit(cmd_verify(os.path.realpath(args.project), change_id=args.change, files_arg=args.files))
+        if args.cmd == "ci-check":
+            sys.exit(cmd_ci_check(os.path.realpath(args.project), base_ref=args.base, change_id=args.change))
         if args.cmd == "hook":
             sys.exit(handle_hook(args.adapter, args.event, change_id=args.change))
     except ValueError as exc:

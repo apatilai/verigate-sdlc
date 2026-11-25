@@ -23,6 +23,8 @@ KIT_ROOT = Path(__file__).resolve().parent
 MARKER_START = "<!-- VERIGATE:START -->"
 MARKER_END = "<!-- VERIGATE:END -->"
 AZDO_VERIGATE_MARKER = "# VeriGate AI-SDLC Policy Gate"
+DEFAULT_VERIGATE_REF = "v3.0.0"
+DEFAULT_VERIGATE_REPO = "https://github.com/apatilai/verigate-sdlc.git"
 
 CLAUDE_PRE_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell"
 CLAUDE_POST_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|Agent|Task"
@@ -38,41 +40,59 @@ def _hook_cmd(script_rel: str, adapter: str, event: str, python_cmd: str | None 
     return f"{py_tok} {script_rel} hook --adapter {adapter} --event {event}"
 
 
-UNIVERSAL_RULE_BODY = """# Enterprise AI-Native SDLC (Local Agent Guide Rails + CI/PR Policy Gates)
+def _clean_ci_param(value: str, label: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or "\n" in cleaned or "\r" in cleaned:
+        raise ValueError(f"Invalid {label}: must be a non-empty single-line string.")
+    return cleaned
 
-This repository uses the **6-Stage VeriGate AI-Native Software Development Lifecycle (AI-SDLC)** combining **local agent guide rails** with **CI/PR policy gates**:
 
-- **Local Agent Guide Rails**: Cooperative lifecycle hooks, SHA-256 content-hash spec tracking, shell/PowerShell write checks, real test/IaC runner exit-code verification, and non-trapping Stop reminders catch honest mistakes early in your local IDE/CLI session.
-- **Hard Enterprise Controls (CI/PR Boundary)**: Local hooks are developer guide rails — NOT a substitute for bank-grade access controls. CI `verigate.py validate` and `verigate.py merge-check` are **artifact consistency checks** (verifying that specs, SHA-256 hashes, and review files are internally consistent). Real human approval is enforced by **Git branch protection + required CODEOWNERS reviewer on `.sdlc/changes/**`** alongside CI/CD checks (`.github/workflows/verigate-gate.yml` / `azure-pipelines.yml`).
+def _yaml_dq(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _yaml_sq(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+UNIVERSAL_RULE_BODY = """# Enterprise AI-Native SDLC v3.0 (Git + Pinned PR Pipeline + Optional AI Hooks)
+
+This repository uses the **6-Stage VeriGate AI-Native Software Development Lifecycle (AI-SDLC v3.0)**. VeriGate works with any tool — humans, Claude, Antigravity, Codex, Cursor, Windsurf, Copilot, or multi-agent swarms — because **core enforcement lives at Git commit/push and the PR pipeline**, not inside an AI tool:
+
+- **Layer 1 — Git Hooks (`.githooks/pre-commit` & `.githooks/pre-push`)**: Blocks commits touching configured `gated_paths` without a required `.sdlc/changes/<ticket>/` folder and approved plan, and blocks pushes without a fresh commit-bound `verify-result.json` (`head_commit` + `tree_digest`).
+- **Layer 2 — Pinned PR Pipeline (`verigate ci-check`)**: Runs VeriGate from a **pinned release tag** (never from the untrusted PR branch) and **recomputes all configured verification commands from scratch** — never trusting laptop `verify-result.json`, enforcing required change folders for touched gated paths, and failing closed when a required tool is missing.
+- **Layer 3 — PR Human Approval (`CODEOWNERS` on `.sdlc/changes/**`)**: Enforces named human reviewer sign-off via GitHub branch protection or Azure DevOps branch policies.
+- **Optional AI Tool Hooks (Early-Feedback Adapters)**: IDE/CLI lifecycle hooks (Claude Code, Antigravity/Gemini) catch honest mistakes early at edit time, while full gating works even with zero AI hooks installed.
 
 ## 1. Six Stages, Artifacts & Control Layers
 
-| Stage | Role | Verified Artifact | Guide Rail / Policy Gate |
+| Stage | Role | Verified Artifact | Control Layer / Policy Gate |
 | :--- | :--- | :--- | :--- |
-| **S1: Plan** | `verigate-requirements` | `.sdlc/intent.md` or `.sdlc/changes/<ticket>/intent.md` (`AC-1..AC-N`) | SHA-256 content approval checked before `src/*` edits on Greenfield/Feature work |
-| **S2: Design** | `verigate-architect` | `.sdlc/spec.md` or `.sdlc/changes/<ticket>/spec.md` (Contracts & Matrix) | SHA-256 content approval verified against `approvals.json` + shadow/HEAD ledger |
-| **S3: Build** | `verigate-builder` | Modular source / IaC code | Secret files (`.env`, `*.pem`, `*.key`), `.sdlc/bin/*`, and `.sdlc/approvals*` edits blocked by local hooks |
-| **S4: Verify** | `verigate-verifier` | Executed tests/IaC checks or Logged Waiver | Stop / Commit gate requires a real test/IaC command exit code `0` or a `verigate.py waive` audit entry |
+| **S1: Plan** | `verigate-requirements` | `.sdlc/changes/<ticket>/intent.md` (or `.sdlc/intent.md`) (`AC-1..AC-N`) | Required change folder + SHA-256 content approval enforced by Git `pre-commit` & PR `ci-check` |
+| **S2: Design** | `verigate-architect` | `.sdlc/changes/<ticket>/spec.md` (or `.sdlc/spec.md`) (Contracts & Matrix) | SHA-256 content approval verified against `approvals.json` + committed `HEAD` |
+| **S3: Build** | `verigate-builder` | Modular source / IaC code matching `gated_paths` | Secret files (`.env`, `*.pem`, `*.key`) blocked at `pre-commit` and optional AI hooks |
+| **S4: Verify** | `verigate-verifier` | Commit-bound `verify-result.json` or Logged Waiver | Run `python3 .sdlc/bin/verigate.py verify --project .` before push; Git `pre-push` checks fresh proof and CI `ci-check` recomputes all checks from scratch |
 | **S5: Review** | `verigate-reviewer` + `verigate-sentinel` | `review-findings.json` + `review-report.md` | Governed 6-pillar code review against `.sdlc/REVIEW.md` |
-| **S6: Triage** | `issue_bridge.py` + Human | GitHub Issues / Azure DevOps + Fix | Simultaneous prompt to raise tickets (`gh` / `az boards`) AND fix selected findings; CI/PR artifact consistency check verifies merge readiness while branch protection + CODEOWNERS on `.sdlc/changes/**` enforces human approval |
+| **S6: Triage** | `issue_bridge.py` + Human | GitHub Issues / Azure DevOps + Fix | Simultaneous prompt to raise tickets (`gh` / `az boards`) AND fix selected findings; pinned PR `ci-check` + branch protection + `CODEOWNERS` on `.sdlc/changes/**` enforces merge readiness |
 
-## 2. Per-Change Isolation (`.sdlc/changes/<ticket>/`)
+## 2. Declarative Config & Per-Change Isolation
 
-- For parallel branches or multi-ticket work, isolate artifacts per ticket with `--change <ticket>` (or set `VERIGATE_CHANGE=<ticket>` / `.sdlc/active-change`):
-  - Artifacts live under `.sdlc/changes/<ticket>/` (`intent.md`, `spec.md`, `approvals.json`, `waivers.jsonl`, `review-findings.json`, `review-report.md`).
-- When no change ID is active, VeriGate falls back to root `.sdlc/` for single-stream compatibility.
+- Configure repo-specific `gated_paths`, per-path `verify` commands, `change_id.branch_pattern`, `require_change_folder_for_gated_paths`, and `fail_on_missing_tool` in `.sdlc/config.json` (or repo-root `verigate.json`).
+- Isolate artifacts per ticket under `.sdlc/changes/<ticket>/` (`intent.md`, `spec.md`, `approvals.json`, `verify-result.json`, `waivers.jsonl`, `review-findings.json`, `review-report.md`) using `--change <ticket>`, branch naming (e.g. `feature/PROJ-123-...`), `VERIGATE_CHANGE=<ticket>`, or `.sdlc/active-change`.
 
 ## 3. Mandatory Operating Protocol (Any LLM / Agent)
 
-1. **Stage Dispatch First**: On every new feature, product, or change prompt, display the 6-stage dispatch plan (`python3 .sdlc/bin/verigate.py dispatch "<prompt>"` if not already rendered by a lifecycle hook).
-2. **Content-Hash Approval Before Coding (Greenfield & Features)**:
+1. **Stage Dispatch First**: On every new feature, product, or change prompt, display the 6-stage dispatch plan (`python3 .sdlc/bin/verigate.py dispatch "<prompt>"` if not already rendered by an optional hook).
+2. **Content-Hash Approval Before Coding (Gated Paths)**:
    - Draft `intent.md` (`>=200` chars, Scope, Constraints, `AC-1`, `AC-2+`) and `spec.md` (`>=250` chars, Architecture, Security/Guardrails, Verification Matrix referencing `AC-1`).
    - Present a summary to the user and run standalone:
      `python3 .sdlc/bin/verigate.py approve --project . --stage S1_S2` (add `--change <ticket>` when using per-change folders).
    - Any edit to `intent.md` or `spec.md` invalidates the SHA-256 hash (`STALE APPROVAL`) and requires re-approval.
-3. **Real Verification & Logged Waivers**:
-   - After modifying source or Terraform/IaC files, run real test/validation commands (`S4`, e.g., `pytest`, `unittest`, `npm test`, `terraform fmt -check`, `terraform validate`, `tflint`) and governed code review (`S5` -> `review-findings.json` & `review-report.md`).
-   - If a test tool or runtime is unavailable, never loop—explain the blocker and run standalone:
+3. **Commit-Bound Verification (`verigate verify`) & Logged Waivers**:
+   - After modifying code or IaC under `gated_paths`, run:
+     `python3 .sdlc/bin/verigate.py verify --project .` (add `--change <ticket>` when applicable) to execute configured verification commands, capture real OS exit codes, and write commit-bound `verify-result.json` (`head_commit` + `tree_digest`) required by `.githooks/pre-push`.
+   - Also complete governed code review (`S5` -> `review-findings.json` & `review-report.md`).
+   - If a required test tool or runtime is unavailable locally, never loop — explain the blocker and run standalone:
      `python3 .sdlc/bin/verigate.py waive --project . --stage S4_TEST --reason "<exact blocker>"`
 4. **Simultaneous GitHub / Azure DevOps + Immediate Fix Prompt**:
    - Whenever Stage 5 surfaces findings (`REV-001..REV-N`), present the **Executive Review Scorecard** and ask the user **both questions at the same time**:
@@ -80,11 +100,24 @@ This repository uses the **6-Stage VeriGate AI-Native Software Development Lifec
      2. Fix Critical/High or ALL findings right now and re-verify?"""
 
 
-GITHUB_ACTIONS_CI_YML = """# VeriGate AI-SDLC Artifact Consistency Check (GitHub Actions)
-# Note: `validate` and `merge-check` are artifact consistency checks.
-# Enforce real human approval via GitHub branch protection + required CODEOWNERS reviewer on `.sdlc/changes/**`.
-name: VeriGate AI-SDLC Consistency Check
+def _render_github_actions_ci(
+    verigate_ref: str = DEFAULT_VERIGATE_REF,
+    verigate_repo: str = DEFAULT_VERIGATE_REPO,
+) -> str:
+    ref = _clean_ci_param(verigate_ref, "verigate_ref")
+    repo = _clean_ci_param(verigate_repo, "verigate_repo")
+    return f"""# VeriGate AI-SDLC v3.0 Pinned PR Pipeline Gate (GitHub Actions)
+# Security: Checks out a pinned VeriGate release into $RUNNER_TEMP/verigate instead of
+# running any checker script from the untrusted PR branch.
+# `verigate ci-check` recomputes all configured verification commands from scratch (never
+# trusting laptop verify-result.json), enforces required change folders for touched gated
+# paths, and fails closed if a required tool is missing.
+# Enforce human approval via GitHub branch protection + required CODEOWNERS reviewer on `.sdlc/changes/**`.
+name: VeriGate AI-SDLC Policy Gate
 on: [pull_request, push]
+env:
+  VERIGATE_REPO: {_yaml_dq(repo)}
+  VERIGATE_REF: {_yaml_dq(ref)}
 jobs:
   verigate-verify:
     runs-on: ubuntu-latest
@@ -95,83 +128,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: VeriGate Artifact Consistency Checks (PR-Scoped)
+      - name: Checkout Pinned VeriGate Release
         run: |
           set -e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.base_ref }}"
+          VERIGATE_DIR="${{RUNNER_TEMP:-/tmp}}/verigate"
+          rm -rf "$VERIGATE_DIR"
+          if ! git clone --depth 1 --branch "$VERIGATE_REF" "$VERIGATE_REPO" "$VERIGATE_DIR" 2>/dev/null; then
+            git init "$VERIGATE_DIR"
+            git -C "$VERIGATE_DIR" remote add origin "$VERIGATE_REPO"
+            git -C "$VERIGATE_DIR" fetch --depth 1 origin "$VERIGATE_REF"
+            git -C "$VERIGATE_DIR" checkout --detach FETCH_HEAD
+          fi
+      - name: VeriGate Pinned PR Verification & Policy Gate (ci-check)
+        run: |
+          set -e
+          VERIGATE_BIN="${{RUNNER_TEMP:-/tmp}}/verigate/bin"
+          if [ "${{{{ github.event_name }}}}" = "pull_request" ]; then
+            BASE="${{{{ github.base_ref }}}}"
             git fetch --no-tags origin "$BASE" 2>/dev/null || true
-            CHANGED_FILES="$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+            python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "origin/$BASE"
           else
-            CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
-          fi
-          TOUCHED_CHANGES="$(printf '%s\n' "$CHANGED_FILES" | sed -n 's|^\\.sdlc/changes/\\([^/]*\\)/.*|\\1|p' | sort -u)"
-          ROOT_SDLC_TOUCHED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^\\.sdlc/[^/]+$' || true)"
-          if [ -n "$ROOT_SDLC_TOUCHED" ]; then
-            if [ -f .sdlc/intent.md ]; then
-              python3 .sdlc/bin/verigate.py validate --project .
-            fi
-            if [ -f .sdlc/review-findings.json ]; then
-              python3 .sdlc/bin/verigate.py merge-check --project .
-            fi
-          fi
-          for cid in $TOUCHED_CHANGES; do
-            [ -d ".sdlc/changes/$cid" ] || continue
-            if [ -f ".sdlc/changes/$cid/intent.md" ]; then
-              python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
-            fi
-            if [ -f ".sdlc/changes/$cid/review-findings.json" ]; then
-              python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
-            fi
-          done
-          if [ -z "$ROOT_SDLC_TOUCHED" ] && [ -z "$TOUCHED_CHANGES" ]; then
-            echo "No .sdlc/ or .sdlc/changes/<ticket>/ artifacts touched in this diff; skipping consistency checks."
-          fi
-      - name: Optional Terraform / IaC Validation (Configured or Touched Dirs)
-        run: |
-          set -e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.base_ref }}"
-            CHANGED_FILES="$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
-          else
-            CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
-          fi
-          TF_DIRS="$(python3 -c '
-          import json, pathlib
-          p = pathlib.Path(".sdlc/config.json")
-          if p.is_file():
-              try:
-                  dirs = json.loads(p.read_text(encoding="utf-8")).get("terraform_dirs") or []
-                  for d in dirs:
-                      if isinstance(d, str) and d.strip():
-                          print(d.strip())
-              except Exception:
-                  pass
-          ')"
-          if [ -z "$TF_DIRS" ]; then
-            TF_DIRS="$(printf '%s\n' "$CHANGED_FILES" | grep -E '\\.tf$' | while IFS= read -r f; do [ -f "$f" ] && dirname "$f"; done | sort -u)"
-          fi
-          if [ -n "$TF_DIRS" ]; then
-            if command -v terraform >/dev/null 2>&1; then
-              printf '%s\n' "$TF_DIRS" | while IFS= read -r tf_dir; do
-                [ -d "$tf_dir" ] || continue
-                echo "Validating Terraform directory: $tf_dir"
-                (cd "$tf_dir" && terraform fmt -check && terraform init -backend=false && terraform validate) || exit 1
-              done
-            else
-              echo "Terraform directories detected; install terraform in CI runner to enforce fmt/validate."
-            fi
+            python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "HEAD~1"
           fi
 """
 
 
-AZURE_PIPELINES_CI_YML = AZDO_VERIGATE_MARKER + """ (Azure Pipelines)
-# Note: `validate` and `merge-check` are artifact consistency checks.
-# Enforce real human approval via Azure DevOps branch policies + required CODEOWNERS reviewer on `.sdlc/changes/**`.
+def _render_azure_pipelines_ci(
+    verigate_ref: str = DEFAULT_VERIGATE_REF,
+    verigate_repo: str = DEFAULT_VERIGATE_REPO,
+) -> str:
+    ref = _clean_ci_param(verigate_ref, "verigate_ref")
+    repo = _clean_ci_param(verigate_repo, "verigate_repo")
+    return f"""{AZDO_VERIGATE_MARKER} (Azure Pipelines - Pinned Release v3.0)
+# Security: Checks out a pinned VeriGate release into $(Agent.TempDirectory)/verigate instead of
+# running any checker script from the untrusted PR branch.
+# `verigate ci-check` recomputes all configured verification commands from scratch (never
+# trusting laptop verify-result.json), enforces required change folders for touched gated
+# paths, and fails closed if a required tool is missing.
+# Enforce human approval via Azure DevOps branch policies + required CODEOWNERS reviewer on `.sdlc/changes/**`.
 trigger:
   - main
 pr:
   - main
+
+variables:
+  VERIGATE_REPO: {_yaml_sq(repo)}
+  VERIGATE_REF: {_yaml_sq(ref)}
 
 pool:
   vmImage: 'ubuntu-latest'
@@ -187,71 +189,32 @@ steps:
 
   - script: |
       set -e
-      if [ "$(Build.Reason)" = "PullRequest" ]; then
-        git fetch --no-tags origin "$(System.PullRequest.TargetBranchName)" 2>/dev/null || true
-        CHANGED_FILES="$(git diff --name-only "origin/$(System.PullRequest.TargetBranchName)...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
-      else
-        CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+      VERIGATE_DIR="$(Agent.TempDirectory)/verigate"
+      rm -rf "$VERIGATE_DIR"
+      if ! git clone --depth 1 --branch "$(VERIGATE_REF)" "$(VERIGATE_REPO)" "$VERIGATE_DIR" 2>/dev/null; then
+        git init "$VERIGATE_DIR"
+        git -C "$VERIGATE_DIR" remote add origin "$(VERIGATE_REPO)"
+        git -C "$VERIGATE_DIR" fetch --depth 1 origin "$(VERIGATE_REF)"
+        git -C "$VERIGATE_DIR" checkout --detach FETCH_HEAD
       fi
-      TOUCHED_CHANGES="$(printf '%s\n' "$CHANGED_FILES" | sed -n 's|^\\.sdlc/changes/\\([^/]*\\)/.*|\\1|p' | sort -u)"
-      ROOT_SDLC_TOUCHED="$(printf '%s\n' "$CHANGED_FILES" | grep -E '^\\.sdlc/[^/]+$' || true)"
-      if [ -n "$ROOT_SDLC_TOUCHED" ]; then
-        if [ -f .sdlc/intent.md ]; then
-          python3 .sdlc/bin/verigate.py validate --project .
-        fi
-        if [ -f .sdlc/review-findings.json ]; then
-          python3 .sdlc/bin/verigate.py merge-check --project .
-        fi
-      fi
-      for cid in $TOUCHED_CHANGES; do
-        [ -d ".sdlc/changes/$cid" ] || continue
-        if [ -f ".sdlc/changes/$cid/intent.md" ]; then
-          python3 .sdlc/bin/verigate.py validate --project . --change "$cid"
-        fi
-        if [ -f ".sdlc/changes/$cid/review-findings.json" ]; then
-          python3 .sdlc/bin/verigate.py merge-check --project . --change "$cid"
-        fi
-      done
-      if [ -z "$ROOT_SDLC_TOUCHED" ] && [ -z "$TOUCHED_CHANGES" ]; then
-        echo "No .sdlc/ or .sdlc/changes/<ticket>/ artifacts touched in this diff; skipping consistency checks."
-      fi
-    displayName: 'VeriGate Artifact Consistency Checks (PR-Scoped)'
+    displayName: 'Checkout Pinned VeriGate Release'
 
   - script: |
       set -e
+      VERIGATE_BIN="$(Agent.TempDirectory)/verigate/bin"
       if [ "$(Build.Reason)" = "PullRequest" ]; then
-        CHANGED_FILES="$(git diff --name-only "origin/$(System.PullRequest.TargetBranchName)...HEAD" 2>/dev/null || git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+        BASE="$(System.PullRequest.TargetBranchName)"
+        git fetch --no-tags origin "$BASE" 2>/dev/null || true
+        python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "origin/$BASE"
       else
-        CHANGED_FILES="$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)"
+        python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "HEAD~1"
       fi
-      TF_DIRS="$(python3 -c '
-      import json, pathlib
-      p = pathlib.Path(".sdlc/config.json")
-      if p.is_file():
-          try:
-              dirs = json.loads(p.read_text(encoding="utf-8")).get("terraform_dirs") or []
-              for d in dirs:
-                  if isinstance(d, str) and d.strip():
-                      print(d.strip())
-          except Exception:
-              pass
-      ')"
-      if [ -z "$TF_DIRS" ]; then
-        TF_DIRS="$(printf '%s\n' "$CHANGED_FILES" | grep -E '\\.tf$' | while IFS= read -r f; do [ -f "$f" ] && dirname "$f"; done | sort -u)"
-      fi
-      if [ -n "$TF_DIRS" ]; then
-        if command -v terraform >/dev/null 2>&1; then
-          printf '%s\n' "$TF_DIRS" | while IFS= read -r tf_dir; do
-            [ -d "$tf_dir" ] || continue
-            echo "Validating Terraform directory: $tf_dir"
-            (cd "$tf_dir" && terraform fmt -check && terraform init -backend=false && terraform validate) || exit 1
-          done
-        else
-          echo "Terraform directories detected; install terraform in CI agent to enforce fmt/validate."
-        fi
-      fi
-    displayName: 'Optional Terraform / IaC Validation (Configured or Touched Dirs)'
+    displayName: 'VeriGate Pinned PR Verification & Policy Gate (ci-check)'
 """
+
+
+GITHUB_ACTIONS_CI_YML = _render_github_actions_ci()
+AZURE_PIPELINES_CI_YML = _render_azure_pipelines_ci()
 
 
 class _InstallTx:
@@ -412,6 +375,17 @@ def _resolve_azdo_pipeline_path(target_dir: Path) -> Path:
     return root_azdo
 
 
+def _git_hook_script(adapter: str) -> str:
+    return (
+        "#!/usr/bin/env sh\n"
+        "set -e\n"
+        'REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"\n'
+        "PY=python3\n"
+        "command -v python3 >/dev/null 2>&1 || PY=python\n"
+        f'exec "$PY" "$REPO_ROOT/.sdlc/bin/verigate.py" hook --adapter {adapter}\n'
+    )
+
+
 def install(
     target_dir: Path,
     targets: set[str],
@@ -419,11 +393,15 @@ def install(
     require_spec: bool,
     *,
     python_cmd: str | None = None,
+    verigate_ref: str = DEFAULT_VERIGATE_REF,
+    verigate_repo: str = DEFAULT_VERIGATE_REPO,
     dry_run: bool = False,
     backup: bool = True,
 ) -> dict:
     use_all = "all" in targets
     py_cmd = (python_cmd or _default_python_cmd()).strip()
+    clean_ref = _clean_ci_param(verigate_ref, "verigate_ref")
+    clean_repo = _clean_ci_param(verigate_repo, "verigate_repo")
 
     # Fail-closed pre-flight validation on existing JSON hook configs before touching disk
     if use_all or "claude" in targets:
@@ -523,7 +501,7 @@ def install(
         _upsert_markdown_block(
             cur_dir / "verigate.mdc",
             UNIVERSAL_RULE_BODY,
-            frontmatter="---\ndescription: Enterprise 6-Stage AI-SDLC (Local Guide Rails + CI/PR Policy Gates)\nalwaysApply: true\n---",
+            frontmatter="---\ndescription: Enterprise 6-Stage AI-SDLC v3.0 (Git + Pinned PR Pipeline + Optional AI Hooks)\nalwaysApply: true\n---",
             tx=tx,
         )
         installed.append(".cursor/rules/verigate.mdc")
@@ -539,26 +517,35 @@ def install(
         _upsert_markdown_block(gh_dir / "copilot-instructions.md", UNIVERSAL_RULE_BODY, tx=tx)
         installed.append(".github/copilot-instructions.md")
 
-    # 8. CI Gates (GitHub Actions + Azure Pipelines)
+    # 8. Pinned-Release CI Gates (GitHub Actions + Azure Pipelines)
     if use_all or "ci" in targets:
         gh_wf = target_dir / ".github" / "workflows" / "verigate-gate.yml"
-        tx.write_text(gh_wf, GITHUB_ACTIONS_CI_YML)
+        tx.write_text(gh_wf, _render_github_actions_ci(clean_ref, clean_repo))
         installed.append(".github/workflows/verigate-gate.yml")
 
     if use_all or "ci" in targets or "azdo-ci" in targets:
         azdo_path = _resolve_azdo_pipeline_path(target_dir)
-        tx.write_text(azdo_path, AZURE_PIPELINES_CI_YML)
+        tx.write_text(azdo_path, _render_azure_pipelines_ci(clean_ref, clean_repo))
         installed.append(azdo_path.relative_to(target_dir).as_posix())
 
-    # 9. Universal Git Pre-Commit Hook (POSIX sh with repo-root resolution + python3 || python fallback)
+    # 9. Universal Git Pre-Commit & Pre-Push Hooks (POSIX sh with repo-root resolution + python3 || python fallback)
     if use_all or "git" in targets:
         pre_commit = target_dir / ".githooks" / "pre-commit"
         tx.write_text(
             pre_commit,
-            "#!/usr/bin/env sh\nset -e\nREPO_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"\nPY=python3\ncommand -v python3 >/dev/null 2>&1 || PY=python\nexec \"$PY\" \"$REPO_ROOT/.sdlc/bin/verigate.py\" hook --adapter git-pre-commit\n",
+            _git_hook_script("git-pre-commit"),
             executable=True,
         )
         installed.append(".githooks/pre-commit")
+
+        pre_push = target_dir / ".githooks" / "pre-push"
+        tx.write_text(
+            pre_push,
+            _git_hook_script("git-pre-push"),
+            executable=True,
+        )
+        installed.append(".githooks/pre-push")
+
         if not dry_run and activate_git_hooks and (target_dir / ".git").exists():
             subprocess.run(["git", "-C", str(target_dir), "config", "core.hooksPath", ".githooks"], check=False)
 
@@ -566,6 +553,8 @@ def install(
         "target": str(target_dir),
         "dry_run": dry_run,
         "python_cmd": py_cmd,
+        "verigate_ref": clean_ref,
+        "verigate_repo": clean_repo,
         "installed": installed,
         "created": tx.created,
         "updated": tx.updated,
@@ -577,7 +566,7 @@ def install(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bootstrap VeriGate AI-SDLC into any project")
+    parser = argparse.ArgumentParser(description="Bootstrap VeriGate AI-SDLC v3.0 into any project")
     parser.add_argument("--target", required=True, help="Target project directory")
     parser.add_argument(
         "--targets",
@@ -590,6 +579,16 @@ def main() -> None:
         "--python-cmd",
         default=None,
         help="Python executable command for generated JSON hooks (defaults to 'python' on Windows, 'python3' on POSIX)",
+    )
+    parser.add_argument(
+        "--verigate-ref",
+        default=DEFAULT_VERIGATE_REF,
+        help=f"Pinned VeriGate Git tag or commit SHA checked out by generated CI pipelines (default: {DEFAULT_VERIGATE_REF})",
+    )
+    parser.add_argument(
+        "--verigate-repo",
+        default=DEFAULT_VERIGATE_REPO,
+        help=f"VeriGate Git repository URL checked out by generated CI pipelines (default: {DEFAULT_VERIGATE_REPO})",
     )
     parser.add_argument(
         "--dry-run",
@@ -611,6 +610,8 @@ def main() -> None:
             args.activate_git_hooks,
             args.require_spec,
             python_cmd=args.python_cmd,
+            verigate_ref=args.verigate_ref,
+            verigate_repo=args.verigate_repo,
             dry_run=args.dry_run,
             backup=not args.no_backup,
         )

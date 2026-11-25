@@ -1,7 +1,7 @@
 {
-  "detected_provider": "unknown",
+  "detected_provider": "github",
   "verdict": "APPROVE",
-  "quality_score": 98,
-  "summary": "VeriGate AI-SDLC (`verigate-sdlc` v2.3.0) verified: all 4 unittest suites pass including the closed-loop Review <-> Fix -> Team Policy Merge Approval Gate (`verigate.py merge-check`).",
+  "quality_score": 99,
+  "summary": "VeriGate AI-SDLC v2.6 reviewed and verified: all 4 live Windows Claude Code trial findings fixed (standalone final-segment test verification + stdout/stderr failure banners, sanctioned issue_bridge.py gate, read-only .sdlc inspection allowlist, non-crash Stop wording). 21/21 unit tests passing.",
   "findings": []
 }

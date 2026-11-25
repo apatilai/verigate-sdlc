@@ -1,54 +1,124 @@
-# VeriGate AI-SDLC (`verigate-sdlc` v2.5)
+# VeriGate AI-SDLC (`verigate-sdlc` v3.0)
 
-Vendor-neutral, zero-dependency **6-Stage AI-SDLC Framework** combining **local agent guide rails** with **hard CI/PR enterprise policy gates** so teams can run consistent spec-driven workflows across **all LLMs, coding agents, IDEs, Windows/macOS/Linux workstations, and CI pipelines**.
+**Works with any repo and any tool — humans, Claude, Antigravity, Codex, Cursor, or multi-agent swarms — because VeriGate gates at Git commit/push and the PR pipeline, not inside an AI tool.**
+
+VeriGate v3.0 is a zero-dependency, config-driven **6-Stage AI-SDLC Framework** anchored in **Git hooks (`pre-commit` / `pre-push`)**, a **pinned PR CI pipeline (`verigate ci-check`)**, and **PR `CODEOWNERS` approval**. Optional AI-tool hooks can be added for earlier edit-time feedback, while full enforcement works even with **zero AI hooks installed**.
 
 ---
 
-## Security & Control Model: Guide Rails vs. Hard Enterprise Controls
+## Three-Layer Control Architecture
 
-VeriGate separates developer-side assistance from regulated compliance enforcement so teams never confuse local hooks with bank-grade security boundaries:
+VeriGate separates local developer workflow gates from authoritative server-side compliance controls:
 
-| Control Layer | What It Is | What It Provides | Risk & Audit Boundary |
+| Layer | Mechanism | What It Enforces | Control Boundary |
 | :--- | :--- | :--- | :--- |
-| **Local Agent Guide Rails** (`.claude/settings.json`, `.agents/hooks.json`, `.githooks/pre-commit`) | Cooperative workstation guardrails designed to catch honest mistakes and keep coding agents on spec. | SHA-256 `intent.md`/`spec.md` drift tracking; quote-aware `Write`/`Edit`/`MultiEdit`/`NotebookEdit` + `Bash`/`PowerShell` write checks; `.sdlc/active-change` protection; real exit-code-`0` test/IaC runner verification (rejecting `echo pytest`, `pip install pytest`, `pytest \|\| true`, or subagent-only passes); non-trapping 1-intercept `Stop` reminder with a logged circuit breaker. | **Advisory / cooperative.** Local hooks run in the developer's environment and can be bypassed by a determined user with shell access. Do **not** cite local hooks as standalone hard controls in SOC 2, PCI-DSS, or banking audits. |
-| **Hard Enterprise Controls** (Git Host + CI/CD) | Server-side enforcement at the repository and pipeline boundary. | **Git branch protection**, mandatory **human PR approval via `CODEOWNERS` / Required Reviewers on `.sdlc/changes/**`**, and **PR-scoped CI/CD pipeline checks** (`.github/workflows/verigate-gate.yml` for GitHub Actions and `azure-pipelines.yml` / `.azure-pipelines/verigate-gate.yml` for Azure Pipelines) running `verigate.py validate` and `verigate.py merge-check` as **artifact consistency & completeness checks**, plus targeted Terraform/IaC checks. | **Authoritative enforcement boundary.** In regulated and banking environments, actual hard enforcement lives in branch protection, human PR review (`CODEOWNERS` / Required Reviewers), and CI/CD merge gates. |
+| **1. Git `pre-commit` & `pre-push`** | `.githooks/pre-commit` (`git-pre-commit`) and `.githooks/pre-push` (`git-pre-push`) | **`pre-commit`** blocks commits touching configured `gated_paths` without a required change folder (`.sdlc/changes/<ticket>/{intent.md,spec.md}`) and valid `S1_S2` SHA-256 approvals, plus blocks secret files. **`pre-push`** blocks pushes unless `<art_dir>/verify-result.json` has `passed: true`, matches current `head_commit`, and matches the current `tree_digest` of gated files (or a logged waiver exists). | **Local workflow gate** (works for humans and every AI tool without IDE plugins; advisory in regulated audits because local hooks can be bypassed with `--no-verify`). |
+| **2. Pinned PR Pipeline (`verigate ci-check`)** | `.github/workflows/verigate-gate.yml` and `azure-pipelines.yml` checking out a **pinned release tag** (`VERIGATE_REF`, e.g. `v3.0.0`) | Runs VeriGate from the **pinned release checkout** (never executing `.sdlc/bin/verigate.py` from the untrusted PR branch). Inspects PR-touched files against `gated_paths`, enforces required change folders and `HEAD` SHA-256 spec approvals, **recomputes all matching `verify` commands from scratch** (never trusting laptop `verify-result.json`), fails closed when a required tool is missing (`fail_on_missing_tool: true`), and runs `merge-check` when `review-findings.json` is present. | **Authoritative automated gate** at the CI/CD pipeline boundary. |
+| **3. PR Approval (`CODEOWNERS` on `.sdlc/changes/**`)** | GitHub `CODEOWNERS` / Azure DevOps Required Reviewers + branch protection | Requires named human reviewer sign-off on `.sdlc/changes/<ticket>/{intent.md,spec.md}` before merge. | **Authoritative human approval boundary** for SOC 2, PCI-DSS, and regulated/banking audits. |
 
 ### Honest Pipeline & Human Approval Framing (`CODEOWNERS` Required)
 
-`verigate.py validate` and `verigate.py merge-check` are **artifact consistency & completeness checks** — they prove that `intent.md`, `spec.md`, SHA-256 hashes in `approvals.json`, and review artifacts (`review-findings.json` / `review-report.md`) are structurally valid and internally consistent. Because any user or agent with commit access to a feature branch could run `verigate.py approve` locally, these CLI checks **do not** prove that a specific human clicked approve.
+`verigate.py validate`, `verigate.py merge-check`, and `verigate.py ci-check` verify **artifact consistency, completeness, and freshly recomputed check results** — proving that `intent.md`, `spec.md`, SHA-256 hashes in `approvals.json`, review artifacts, and configured verification commands all pass on the PR commit. Because any developer or agent with branch commit access can run `verigate.py approve` locally, CLI hashes alone **do not** prove a specific human clicked approve.
 
-**Recommended enterprise control:** Configure **GitHub `CODEOWNERS`** or **Azure DevOps Required Reviewers** on `.sdlc/changes/**` together with **branch protection** (requiring PR review and status checks before merge) so a real human reviewer must explicitly approve `.sdlc/changes/<ticket>/{intent.md,spec.md}` on the PR:
+Configure **GitHub `CODEOWNERS`** or **Azure DevOps Required Reviewers** on `.sdlc/changes/**` with **branch protection** so a named human reviewer must approve the plan on the PR:
 
 ```text
 # .github/CODEOWNERS (or Azure DevOps Branch Policy -> Automatically Included Reviewers)
 /.sdlc/changes/**    @org/tech-leads @org/security-reviewers
 ```
 
-### Known Limits (Advisory Local Hooks)
+---
 
-Local shell/PowerShell write detection uses lightweight quote-aware regex heuristics (so read-only commands like `git log --format="%h -> %s"` or `python -c "print(1>0)"` do not trigger false alarms). Because local hooks are **cooperative guide rails** rather than an OS sandbox, they intentionally do **not** intercept every possible script or binary write path, including:
+## Per-Repo Declarative Config (`verigate.json` / `.sdlc/config.json`)
 
-- Arbitrary scripts or binaries performing file I/O (e.g., `python gen.py`)
-- Inline Python `pathlib` writes (e.g., `Path.write_text(...)`)
-- Patch application commands (`git apply`)
-- PowerShell `New-Item`
-- Network download-to-file commands (`curl -o`)
+Configure gating rules per repository in repo-root **`verigate.json`** (or **`.sdlc/config.json`** as fallback). Customer-defined `gated_paths` control which paths require a change folder and which real verification commands run for each path:
 
-This is why local hooks are positioned strictly as developer-side guide rails, while authoritative enforcement belongs in server-side **branch protection + `CODEOWNERS` / Required Reviewers + CI/CD gates**.
+```json
+{
+  "version": "3.0.0",
+  "require_spec_approval": true,
+  "require_change_folder_for_gated_paths": true,
+  "fail_on_missing_tool": true,
+  "change_id": {
+    "branch_pattern": "([A-Z][A-Z0-9]{1,10}-\\d+)"
+  },
+  "gated_paths": [
+    {
+      "pattern": "terraform/**",
+      "verify": ["terraform fmt -check", "terraform validate", "tflint"],
+      "cwd": "terraform"
+    },
+    {
+      "pattern": "services/**",
+      "verify": ["pytest -q"],
+      "cwd": "."
+    },
+    {
+      "pattern": "src/**",
+      "verify": ["python3 -m unittest discover -s tests"],
+      "cwd": "."
+    }
+  ],
+  "approvers": {
+    "codeowners_paths": [".sdlc/changes/**"],
+    "required_reviewers": ["@org/tech-leads", "@org/security-reviewers"]
+  },
+  "tracker": {
+    "provider": "auto",
+    "min_severity": "High"
+  }
+}
+```
+
+### Key Config Fields
+
+- **`gated_paths`**: List of `{ "pattern", "verify", "cwd" }` rules using normalized glob patterns (`**`, `*`, `?`). Non-gated paths (e.g., `docs/notes.md`) are not blocked by gated-path rules. If omitted, VeriGate falls back to matching non-meta project files (and retains backward compatibility with `terraform_dirs`).
+- **`require_change_folder_for_gated_paths`**: Defaults to `true` when `gated_paths` is configured or `require_spec_approval` is `true`. Touching any gated path without `.sdlc/changes/<ticket>/{intent.md,spec.md}` **fails closed** in `git-pre-commit` and `ci-check` — omitting a change folder is never a bypass.
+- **`fail_on_missing_tool`**: Defaults to `true`. If a configured `verify` binary is missing (`FileNotFoundError` / exit `127`), verification **fails closed** instead of silently passing. Set to `false` only if you intentionally want missing binaries recorded as `skipped_missing_tool: true`.
+- **`change_id.branch_pattern`**: Regex used to auto-derive the ticket/change ID from the Git branch name (e.g., `feature/PROJ-123-auth` → `PROJ-123`).
+- **`approvers`**: Documents `codeowners_paths` (default `[".sdlc/changes/**"]`) and `required_reviewers` for PR review policy alignment.
+- **`tracker`**: Default issue tracker settings (`provider`: `auto` | `github` | `azdo`, `min_severity`: `Critical` | `High` | `Medium` | `Low`).
 
 ---
 
-## Supported LLMs, Coding Surfaces & CI Platforms
+## Real Execution & Commit-Bound Proof (`verigate verify`)
 
-| AI / Engineering Surface | Native Files Generated by `install_verigate.py` | Local Guide Rails & Hard CI Gates |
-| :--- | :--- | :--- |
-| **Google Antigravity & Gemini CLI** | `GEMINI.md`, `AGENTS.md`, `.agents/hooks.json`, `.agents/skills/*` | Native `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop` guide rails (direct Python invocation, no `sh -c`) |
-| **Claude Code** | `CLAUDE.md`, `.claude/settings.json`, `.claude/agents/*`, `.claude/skills/*` | Native `UserPromptSubmit`, `PreToolUse` (`Write\|Edit\|MultiEdit\|NotebookEdit\|Bash\|PowerShell`), `PostToolUse` (`...\|Agent\|Task`), `Stop` guide rails via `$CLAUDE_PROJECT_DIR` |
-| **OpenAI Codex** | `AGENTS.md`, `.agents/skills/*` | `AGENTS.md` + local Git `pre-commit` + CI/PR Gate |
-| **Cursor & Windsurf** | `.cursor/rules/verigate.mdc`, `.windsurfrules`, `AGENTS.md` | Always-on `.mdc` rule + local Git `pre-commit` + CI/PR Gate |
-| **GitHub Copilot & GitHub Actions** | `.github/copilot-instructions.md`, `.github/workflows/verigate-gate.yml` | Copilot instructions + **PR-scoped GitHub Actions consistency gate** (`validate`, `merge-check`, targeted Terraform) + `CODEOWNERS` |
-| **Azure DevOps / Azure Pipelines** | `azure-pipelines.yml` (or `.azure-pipelines/verigate-gate.yml` if `azure-pipelines.yml` exists) | **PR-scoped Azure Pipelines consistency gate** (`validate`, `merge-check`, targeted Terraform) + Required Reviewers + `az boards` triage |
-| **Any Chat / Local LLM (Ollama, ChatGPT, DeepSeek, etc.)** | `.githooks/pre-commit`, `.sdlc/bin/verigate.py`, `.sdlc/bin/issue_bridge.py` | Local `pre-commit` guide rail + server-side CI/PR Gate |
+Instead of scraping chat logs or trusting subagent claims, **`verigate verify`** executes configured commands directly and binds the result to the exact repository state:
+
+```bash
+# Run all configured gated_paths verification commands
+python3 .sdlc/bin/verigate.py verify --project .
+
+# Scope to a specific change ID or specific changed files
+python3 .sdlc/bin/verigate.py verify --project . --change PROJ-123 --files services/api.py,src/app.py
+```
+
+How `verigate verify` works:
+1. Matches changed/staged/specified files (or all rules when `--files` is omitted) against `gated_paths` in `verigate.json` / `.sdlc/config.json`.
+2. Runs each configured `verify` command directly with `subprocess.run(..., shell=False)` in the rule's `cwd` and captures the **real OS exit code**.
+3. **Fails closed on missing tools**: If a required binary is not installed, marks `missing_tool: true` and fails (`exit 1`) whenever `fail_on_missing_tool: true`.
+4. Writes commit-bound **`<art_dir>/verify-result.json`** containing:
+   - `head_commit`: current `git rev-parse HEAD` (or `"UNCOMMITTED"`)
+   - `tree_digest`: SHA-256 digest over sorted `(rel_path, file_sha256)` of all gated/target files
+   - `passed`, `change_id`, `fail_on_missing_tool`, `timestamp`, and per-command `results` (`pattern`, `command`, `cwd`, `exit_code`, `missing_tool`, `passed`, `duration_ms`, `stdout_tail`, `stderr_tail`).
+5. **Verified at `git push`**: `.githooks/pre-push` rejects pushes if `verify-result.json` is missing, `passed` is `false`, `head_commit` does not match `HEAD`, or any gated file changed after verification (`tree_digest` mismatch).
+
+---
+
+## Pinned PR Pipeline (`verigate ci-check`)
+
+CI workflows generated by `install_verigate.py` (`--targets ci` or `--targets azdo-ci`) **never execute `.sdlc/bin/verigate.py` from the untrusted PR branch**. Instead, they check out VeriGate from a **pinned release tag** (`VERIGATE_REF`, default `v3.0.0`) into an isolated runner temp directory and invoke `ci-check`:
+
+```bash
+python3 "$VERIGATE_BIN/verigate.py" ci-check --project . --base "origin/$BASE"
+```
+
+What `verigate ci-check` enforces on every PR:
+1. Computes PR-touched files (`git diff --name-only <base>...HEAD`) and matches them against `gated_paths`.
+2. **Never trusts laptop `verify-result.json`** — even if a PR commits a forged `"passed": true` file, CI **recomputes every matching `verify` command from scratch** on the CI runner (failing closed on missing tools when `fail_on_missing_tool: true`).
+3. Enforces the required change folder (`.sdlc/changes/<ticket>/{intent.md,spec.md}`) whenever gated paths are touched and `require_change_folder_for_gated_paths` is `true`.
+4. Validates `intent.md` and `spec.md` content standards and `HEAD` SHA-256 approval consistency.
+5. Runs `merge-check` policy consistency if `review-findings.json` is present in the change folder.
 
 ---
 
@@ -60,62 +130,79 @@ git clone https://github.com/apatilai/verigate-sdlc.git
 # Preview every file that would be created, updated, or backed up (writes nothing)
 python3 verigate-sdlc/install_verigate.py \
   --target /path/to/your-project \
-  --targets all \
+  --targets git,ci \
+  --verigate-ref v3.0.0 \
   --dry-run
 
-# Install (automatically backs up pre-existing files to .sdlc/backups/<UTC-timestamp>/)
+# Minimal core install (Git pre-commit + pre-push + Pinned CI workflows — zero AI hooks needed)
+python3 verigate-sdlc/install_verigate.py \
+  --target /path/to/your-project \
+  --targets git,ci \
+  --verigate-ref v3.0.0 \
+  --activate-git-hooks
+
+# Full install (Core Git + Pinned CI + optional AI-tool early-feedback adapters)
 python3 verigate-sdlc/install_verigate.py \
   --target /path/to/your-project \
   --targets all \
+  --verigate-ref v3.0.0 \
   --activate-git-hooks
 ```
 
-### Windows, Subdirectory & Cross-Platform Installation
+### Safe Upgrades, Pinning & Cross-Platform Notes
 
-- **No `sh -c` dependency**: `.claude/settings.json` and `.agents/hooks.json` invoke Python directly (`python` on Windows, `python3` on macOS/Linux) so hooks work natively in Windows PowerShell and Command Prompt without Git Bash or WSL.
-- **Subdirectory-safe hook paths (`$CLAUDE_PROJECT_DIR`)**: `.claude/settings.json` invokes `"$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py"` so Claude Code hooks keep working even when commands run from a nested subdirectory. `.githooks/pre-commit` resolves the repo root via `git rev-parse --show-toplevel`, and `.agents/hooks.json` resolves relative to `.agents/`.
-- **Custom Python executable**: Pass `--python-cmd python` (or a full venv path) to pin the interpreter written into hook configs.
-- **Live hook payload debugging (`VERIGATE_DEBUG_HOOK=1`)**: Export `VERIGATE_DEBUG_HOOK=1` to append sanitized hook event metadata (event name, `tool_name`, and `tool_response` keys) to `hook_debug.jsonl` in VeriGate's local state directory. Use this to verify live Claude Code hook payloads and exit-code parsing (which supports both dict fields and string responses containing `Exit code <N>`).
-- **Safe upgrades & fail-closed JSON merge**:
-  - `--dry-run` prints a JSON plan without touching the filesystem.
-  - Pre-existing target files are backed up to `.sdlc/backups/<UTC-timestamp>/<rel_path>` before modification (pass `--no-backup` to opt out).
-  - If an existing `.claude/settings.json` or `.agents/hooks.json` contains malformed JSON, `install_verigate.py` **fails closed** (exits non-zero) rather than overwriting your configuration.
-- **CI targets**: `--targets ci` generates both GitHub Actions (`.github/workflows/verigate-gate.yml`) and Azure Pipelines (`azure-pipelines.yml`, or `.azure-pipelines/verigate-gate.yml` if `azure-pipelines.yml` already exists). Use `--targets azdo-ci` for Azure Pipelines only.
+- **Pinned CI release flags**: Pass `--verigate-ref <tag-or-sha>` (default `v3.0.0`) and `--verigate-repo <git-url>` to control which trusted VeriGate release GitHub Actions (`.github/workflows/verigate-gate.yml`) and Azure Pipelines (`azure-pipelines.yml` or `.azure-pipelines/verigate-gate.yml`) check out.
+- **No `sh -c` dependency**: Optional AI hook configs invoke Python directly (`python` on Windows, `python3` on macOS/Linux) so they work natively on Windows PowerShell/CMD without Git Bash or WSL. Pass `--python-cmd <path>` to pin a specific interpreter.
+- **Subdirectory-safe paths**: `.githooks/pre-commit` and `.githooks/pre-push` resolve `git rev-parse --show-toplevel`; `.claude/settings.json` uses `"$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py"`.
+- **Backups & fail-closed JSON merge**: Pre-existing files are backed up to `.sdlc/backups/<UTC-timestamp>/<rel_path>` before modification (use `--no-backup` to opt out). Malformed JSON in existing `.claude/settings.json` or `.agents/hooks.json` **fails closed** instead of overwriting user settings.
+
+---
+
+## Optional Early-Feedback Adapters (AI-Tool Hooks & Rules)
+
+Full VeriGate gating works with **zero AI hooks installed** because enforcement happens at **Git `pre-commit`/`pre-push` + Pinned PR Pipeline (`ci-check`) + `CODEOWNERS`**. Teams using AI coding tools can optionally install tool-specific adapters (`--targets all` or individual targets) to catch mistakes earlier at **edit time** rather than waiting for commit or push:
+
+| Optional Adapter | Generated Files | Early-Feedback Behavior |
+| :--- | :--- | :--- |
+| **Claude Code** (`claude`) | `CLAUDE.md`, `.claude/settings.json`, `.claude/agents/*`, `.claude/skills/*` | Edit-time `UserPromptSubmit`, `PreToolUse` (`Write\|Edit\|MultiEdit\|NotebookEdit\|Bash\|PowerShell`), `PostToolUse` (`...\|Agent\|Task`), and non-trapping `Stop` guide rails via `$CLAUDE_PROJECT_DIR`. |
+| **Google Antigravity & Gemini CLI** (`antigravity`, `gemini`) | `GEMINI.md`, `AGENTS.md`, `.agents/hooks.json`, `.agents/skills/*` | Edit-time `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop` guide rails (direct Python invocation, no `sh -c`). |
+| **OpenAI Codex** (`codex`) | `AGENTS.md`, `.agents/skills/*` | Repo-level instructions and skills paired with Git `pre-commit`/`pre-push` + Pinned CI. |
+| **Cursor & Windsurf** (`cursor`, `windsurf`) | `.cursor/rules/verigate.mdc`, `.windsurfrules`, `AGENTS.md` | Always-on editor rules paired with Git `pre-commit`/`pre-push` + Pinned CI. |
+| **GitHub Copilot** (`copilot`) | `.github/copilot-instructions.md` | Copilot repo instructions paired with Git `pre-commit`/`pre-push` + Pinned CI. |
+| **Humans / Any Other LLM / Multi-Agent Swarms** (`git,ci`) | `.githooks/pre-commit`, `.githooks/pre-push`, CI workflow templates, `.sdlc/bin/verigate.py` | Full 3-layer Git + Pinned CI + `CODEOWNERS` enforcement with **zero AI hooks required**. |
+
+- **Live hook payload debugging (`VERIGATE_DEBUG_HOOK=1`)**: Export `VERIGATE_DEBUG_HOOK=1` to append sanitized hook event metadata to `hook_debug.jsonl` in VeriGate's local state directory.
+- **Claude Code `Stop` reminder notice**: When the optional Claude Code `Stop` adapter reminds an agent to run `verigate verify` or review before finishing, Claude Code displays the message under its built-in `"Stop hook error occurred"` header prefixed with **`[VeriGate Guide Rail — Not a crash]`**. This is an intentional, non-trapping 1-intercept reminder (with a logged circuit breaker), not a hook crash.
+
+### Known Limits (Advisory Local Hooks)
+
+Optional local AI-tool hooks (and shell/PowerShell write detection heuristics) are **cooperative early-feedback guide rails** rather than an OS sandbox. Lightweight quote-aware regex checks avoid false alarms on read-only commands (such as `git log --format="%h -> %s"` or `python -c "print(1>0)"`), and intentionally do **not** intercept every possible script or binary write path, including:
+
+- Arbitrary scripts or binaries performing file I/O (e.g., `python gen.py`)
+- Inline Python `pathlib` writes (e.g., `Path.write_text(...)`)
+- Patch application commands (`git apply`)
+- PowerShell `New-Item`
+- Network download-to-file commands (`curl -o`)
+
+This is why local AI hooks are strictly optional early-feedback adapters, while authoritative enforcement lives in **Git `pre-commit`/`pre-push` + Pinned PR Pipeline (`verigate ci-check`) + `CODEOWNERS` / Branch Protection**.
 
 ---
 
 ## Per-Change Ticket Folders (`.sdlc/changes/<ticket>/`) & Branch Auto-Detection
 
-To prevent merge conflicts when multiple developers or feature branches work concurrently, scope all VeriGate artifacts (`intent.md`, `spec.md`, `approvals.json`, `waivers.jsonl`, `review-findings.json`, `review-report.md`) to a per-change folder.
+To prevent merge conflicts across concurrent branches, scope all VeriGate artifacts (`intent.md`, `spec.md`, `approvals.json`, `verify-result.json`, `waivers.jsonl`, `review-findings.json`, `review-report.md`) to a per-change folder.
 
 VeriGate resolves the active change ID in this order:
 1. Explicit `--change <ticket>` CLI flag
 2. `VERIGATE_CHANGE` environment variable
-3. `.sdlc/active-change` file
-4. **Git branch name auto-derivation**: branches matching `[A-Z][A-Z0-9]{1,10}-\d+` (e.g., `feature/PROJ-123-auth` → `.sdlc/changes/PROJ-123/`) automatically scope artifacts without extra configuration (skipping `main`, `master`, and detached `HEAD`).
-
-```bash
-# Option 1: Branch-derived automatically (e.g., git checkout -b feature/PROJ-123-auth)
-python3 .sdlc/bin/verigate.py status --project .
-
-# Option 2: Pass --change explicitly
-python3 .sdlc/bin/verigate.py validate --project . --change PROJ-123
-python3 .sdlc/bin/verigate.py approve --project . --change PROJ-123 --stage S1_S2 --approver "tech-lead"
-python3 .sdlc/bin/verigate.py merge-check --project . --change PROJ-123
-
-# Option 3: Set VERIGATE_CHANGE in your shell (or set .sdlc/active-change)
-export VERIGATE_CHANGE=PROJ-123
-python3 .sdlc/bin/verigate.py status --project .
-```
-
-- **`.sdlc/active-change` protection**: `.sdlc/active-change` is treated as a protected governance file (`ask` on direct file write, `deny` on shell write) so an agent cannot silently switch ticket folders to bypass an unapproved spec lock.
-- When no change ID is active, VeriGate remains backward-compatible with root `.sdlc/` files.
+3. `.sdlc/active-change` file (protected governance file)
+4. **Git branch name auto-derivation**: matches `change_id.branch_pattern` from `verigate.json` / `.sdlc/config.json` (default `([A-Z][A-Z0-9]{1,10}-\d+)`, e.g., `feature/PROJ-123-auth` → `.sdlc/changes/PROJ-123/`, skipping `main`, `master`, and detached `HEAD`).
 
 ---
 
-## Specification Content Standards (v2.5)
+## Specification Content Standards (v3.0)
 
-`verigate.py validate` is an **artifact consistency & completeness check** covering both structural requirements and SHA-256 approval integrity:
+`verigate.py validate` and `verigate.py ci-check` enforce structural completeness and SHA-256 approval integrity:
 
 - **`intent.md`** (`.sdlc/changes/<ticket>/intent.md` or `.sdlc/intent.md`):
   - At least **200 characters**
@@ -126,27 +213,7 @@ python3 .sdlc/bin/verigate.py status --project .
   - At least **250 characters**
   - Includes an **Architecture / Module Boundaries / Contracts** section
   - Includes a **Security & Guardrails** section
-  - Includes a **Verification Matrix** referencing `AC-1` (and mapping all `AC-*` to concrete automated checks)
-
----
-
-## Real Verification, PR-Scoped CI & Multi-Root Terraform / IaC Support
-
-Local `PostToolUse` tracking only marks a change as verified when a **real test, lint, type, or IaC command exits with code `0`**:
-
-- **Exact command-segment matching**: Shell commands are parsed into quote-aware segments and checked at the leading program (with wrapper support for `python`, `npx`, `pnpm`, `yarn`, `bun`, `uv run`, `poetry run`, `env`). Non-runner commands (`pip install pytest`, `git commit -m "add pytest config"`, `grep -r jest package.json`, `echo pytest`, `Write-Host pytest`) and error-swallowing fallbacks (`pytest || true`, `pytest; true`) are rejected and never set `verified = True`.
-- Invoking a verifier subagent (`Agent` / `Task`) alone does not set `verified = True` — the underlying command must actually execute and pass.
-- **Terraform & IaC runners recognized out of the box**:
-  - `terraform validate`
-  - `terraform fmt -check`
-  - `terraform test`
-  - `tflint`
-  - `checkov`
-  - `tfsec`
-  - `conftest test`
-  - `opa test` / `opa eval`
-- **PR-scoped CI validation**: Both `.github/workflows/verigate-gate.yml` and `azure-pipelines.yml` inspect the PR diff (`git diff --name-only`) and run `verigate.py validate` and `verigate.py merge-check` **only on `.sdlc/changes/<ticket>/` folders touched in the PR** (or root `.sdlc/` if touched). Historical or unrelated ticket folders never fail an unrelated PR.
-- **Configurable multi-root Terraform CI (`terraform_dirs`)**: Instead of running `terraform init`/`validate` blindly at the repository root, both CI workflows read `terraform_dirs` from `.sdlc/config.json` (e.g., `{"terraform_dirs": ["infra/network", "infra/app"]}`) when non-empty, or automatically fall back to the unique parent directories of `.tf` files touched in the PR diff—running `terraform fmt -check`, `terraform init -backend=false`, and `terraform validate` only inside those directories.
+  - Includes a **Verification Matrix** referencing `AC-1` (mapping all `AC-*` to concrete automated checks)
 
 ---
 
@@ -156,17 +223,23 @@ Local `PostToolUse` tracking only marks a change as verified when a **real test,
 # 1. Print 6-stage agent dispatch plan for any prompt
 python3 .sdlc/bin/verigate.py dispatch "Build a multi-tenant billing API"
 
-# 2. Run artifact consistency validation & record intent.md + spec.md SHA-256 hashes (optionally per ticket)
+# 2. Validate intent.md + spec.md & record S1_S2 SHA-256 hashes (per ticket)
 python3 .sdlc/bin/verigate.py validate --project . --change PROJ-123
 python3 .sdlc/bin/verigate.py approve --project . --change PROJ-123 --stage S1_S2 --approver "tech-lead"
 
-# 3. Record a logged Stop/Test waiver when a tool or environment is unavailable
+# 3. Execute configured gated_paths verify commands & write commit-bound verify-result.json
+python3 .sdlc/bin/verigate.py verify --project . --change PROJ-123
+
+# 4. Record a logged waiver when a tool or environment is genuinely unavailable
 python3 .sdlc/bin/verigate.py waive --project . --change PROJ-123 --stage S4_TEST --reason "Database container offline"
 
-# 4. Run artifact consistency & merge-policy check locally (pair with PR CODEOWNERS + branch protection in CI)
+# 5. Run local artifact consistency & merge-policy check
 python3 .sdlc/bin/verigate.py merge-check --project . --change PROJ-123
 
-# 5. Preview or create GitHub Issues / Azure DevOps Work Items from review-findings.json
+# 6. Run full PR pipeline gate (recomputes verify commands from scratch; used by pinned CI)
+python3 .sdlc/bin/verigate.py ci-check --project . --base origin/main --change PROJ-123
+
+# 7. Preview or create GitHub Issues / Azure DevOps Work Items from review-findings.json
 python3 .sdlc/bin/issue_bridge.py detect --repo .
 python3 .sdlc/bin/issue_bridge.py preview --findings .sdlc/changes/PROJ-123/review-findings.json --provider auto
 python3 .sdlc/bin/issue_bridge.py create --findings .sdlc/changes/PROJ-123/review-findings.json --provider auto --min-severity High
