@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -56,7 +57,7 @@ ALLOWED_ENV_EXAMPLES = {".env.example", ".env.sample", ".env.template"}
 SECRET_EXTS = {".pem", ".key", ".p12", ".pfx"}
 
 PROTECTED_LEDGER_RE = re.compile(
-    r"(^|/)(\.sdlc/(approvals\.json|waivers\.jsonl|audit\.jsonl|bin/[^/]+)|.*shadow_ledger\.json)$",
+    r"(^|/)(\.sdlc/(?:changes/[^/]+/)?(approvals\.json|waivers\.jsonl|audit\.jsonl|bin/[^/]+)|.*shadow_ledger\.json)$",
     re.IGNORECASE,
 )
 GOVERNANCE_RE = re.compile(
@@ -70,11 +71,13 @@ SHELL_CHAIN_OR_REDIRECT_RE = re.compile(r"[;&|`$><\n]")
 ANY_VERIGATE_INVOCATION_RE = re.compile(r"(^|[\s/\"'\\])verigate\.py\b", re.IGNORECASE)
 GIT_NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b.*(?:\s--no-verify\b|\s-[a-zA-Z]*n\b)")
 SHELL_SECRET_WRITE_RE = re.compile(
-    r"(?:>|>>|\btee\b|\bcp\b|\bmv\b).*?(?:^|[\s/\"'])(\.env(?:\.[a-zA-Z0-9_-]+)?|id_rsa|id_ed25519|\S+\.(?:pem|key|p12|pfx))\b",
+    r"(?:>|>>|\btee\b|\bcp\b|\bmv\b|\bsed\s+-i|\bperl\s+-[a-zA-Z]*i|"
+    r"\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Clear-Content|Copy-Item|Move-Item|Rename-Item|New-Item)\b)"
+    r".*?(?:^|[\s/\\\"'=])(\.env(?:\.[a-zA-Z0-9_-]+)?|id_rsa|id_ed25519|[^\s/\\\"'`]+\.(?:pem|key|p12|pfx))(?=$|[\s\"'`;|&)])",
     re.IGNORECASE,
 )
 LEDGER_TAMPER_CMD_RE = re.compile(
-    r"(\.sdlc/(approvals|waivers|audit|bin|config\.json)|\.claude/settings|\.agents/hooks\.json|\.githooks|shadow_ledger\.json|verigate-shadow)",
+    r"(\.sdlc[/\\](?:changes[/\\][^/\\\s]+[/\\])?(approvals|waivers|audit|bin|config\.json)|\.claude[/\\]settings|\.agents[/\\]hooks\.json|\.githooks|shadow_ledger\.json|verigate-shadow)",
     re.IGNORECASE,
 )
 EXTERNAL_MUTATION_CMD_RE = re.compile(
@@ -88,13 +91,24 @@ EXTERNAL_MUTATION_CMD_RE = re.compile(
 TEST_RUNNER_CMD_RE = re.compile(
     r"\b(pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|bun\s+test|vitest|jest|"
     r"cargo\s+test|go\s+test|mvn\s+test|gradle\s+test|dotnet\s+test|"
-    r"ruff\s+check|flake8|mypy|pyright|tsc|eslint)\b",
+    r"ruff\s+check|flake8|mypy|pyright|tsc|eslint|"
+    r"terraform\s+(?:validate|fmt\s+-check|test)|tflint|checkov|tfsec|"
+    r"conftest\s+test|opa\s+(?:test|eval))\b",
     re.IGNORECASE,
 )
+ECHO_OR_PRINT_PREFIX_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*(?:echo|printf|Write-Host|Write-Output)\b",
+    re.IGNORECASE,
+)
+PS_WRITE_CMDLET_RE = re.compile(
+    r"\b(Set-Content|Add-Content|Out-File|Copy-Item|Move-Item)\b",
+    re.IGNORECASE,
+)
+CHANGE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 PROJECT_MARKERS = (".sdlc", ".git", "package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml")
 META_DIR_RE = re.compile(r"(^|/)(\.sdlc|\.claude|\.agents|\.cursor|\.githooks|\.codex)(/|$)")
-REVIEW_ARTIFACT_RE = re.compile(r"(^|/)\.sdlc/review-(report\.md|findings\.json)$")
+REVIEW_ARTIFACT_RE = re.compile(r"(^|/)\.sdlc/(?:changes/[^/]+/)?review-(report\.md|findings\.json)$")
 
 
 def utc_now_iso() -> str:
@@ -234,31 +248,92 @@ def is_meta_or_doc_path(path_str: str) -> bool:
     }
 
 
+def sanitize_change_id(raw: str | None, strict: bool = True) -> str | None:
+    if not raw:
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    if val in (".", "..") or ".." in val or not CHANGE_ID_RE.match(val):
+        if strict:
+            raise ValueError(f"Invalid change ID `{raw}`: must match [a-zA-Z0-9._-]+ without '..'.")
+        return None
+    return val
+
+
+def resolve_change_id(project_root: str, explicit_change: str | None = None, strict: bool = False) -> str | None:
+    if explicit_change is not None and explicit_change.strip():
+        return sanitize_change_id(explicit_change, strict=True)
+    env_change = os.environ.get("VERIGATE_CHANGE")
+    if env_change and env_change.strip():
+        return sanitize_change_id(env_change, strict=strict)
+    active_file = os.path.join(os.path.realpath(project_root), ".sdlc", "active-change")
+    if os.path.isfile(active_file):
+        try:
+            for line in Path(active_file).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return sanitize_change_id(line, strict=False)
+        except OSError:
+            pass
+    return None
+
+
+def resolve_artifact_dir(project_root: str, change_id: str | None = None, strict: bool = False) -> tuple[str, str, str | None]:
+    abs_root = os.path.realpath(project_root)
+    cid = resolve_change_id(abs_root, change_id, strict=strict)
+    if cid:
+        rel_dir = f".sdlc/changes/{cid}"
+        abs_dir = os.path.join(abs_root, ".sdlc", "changes", cid)
+        return abs_dir, rel_dir, cid
+    return os.path.join(abs_root, ".sdlc"), ".sdlc", None
+
+
+def _shadow_project_key(abs_root: str, change_id: str | None = None) -> str:
+    return f"{abs_root}::change::{change_id}" if change_id else abs_root
+
+
 def validate_intent(text: str) -> tuple[bool, str]:
     s = text.strip()
-    if len(s) < 80:
-        return False, "`.sdlc/intent.md` must be >=80 chars with scope, constraints, and Acceptance Criteria."
-    if not re.search(r"\bAC[-_ ]?1\b", s, re.I):
-        return False, "`.sdlc/intent.md` must define numbered Acceptance Criteria (`AC-1..AC-N`)."
+    if len(s) < 200:
+        return (
+            False,
+            "Intent must be >=200 chars with Scope/Goal/Problem, Constraints/Edge-Cases/Non-Goals, and AC-1 & AC-2.",
+        )
+    if not re.search(r"\b(scope|goal|goals|problem|objective|overview)\b", s, re.I):
+        return False, "Intent must include a Scope / Goal / Problem section."
+    if not re.search(r"\b(constraints?|edge[- ]cases?|non[- ]goals?|out[- ]of[- ]scope)\b", s, re.I):
+        return False, "Intent must include a Constraints / Edge-Cases / Non-Goals section."
+    if not (re.search(r"\bAC[-_ ]?1\b", s, re.I) and re.search(r"\bAC[-_ ]?2\b", s, re.I)):
+        return False, "Intent must define at least `AC-1` and `AC-2` Acceptance Criteria."
     return True, "valid"
 
 
 def validate_spec(text: str) -> tuple[bool, str]:
     s = text.strip()
-    if len(s) < 100:
-        return False, "`.sdlc/spec.md` must be >=100 chars with architecture contracts and Verification Matrix."
-    if not re.search(r"\b(contract|schema|module|component|architecture)\b", s, re.I):
-        return False, "`.sdlc/spec.md` must specify module/component boundaries or contracts."
-    if not re.search(r"\b(verif|test|AC[-_ ]?1)\b", s, re.I):
-        return False, "`.sdlc/spec.md` must include a Verification Matrix mapping `AC-*` to tests."
+    if len(s) < 250:
+        return (
+            False,
+            "Spec must be >=250 chars with Architecture/Module/Contract, Security/Guardrails, and Verification Matrix referencing AC-1.",
+        )
+    if not re.search(r"\b(architecture|module|component|contract|schema)\b", s, re.I):
+        return False, "Spec must include an Architecture / Module / Contract section."
+    if not re.search(
+        r"\b(security|guardrails?|threat|auth(?:n|z|entication|orization)?|access[- ]control|hardening)\b",
+        s,
+        re.I,
+    ):
+        return False, "Spec must include a Security / Guardrails section."
+    if not (re.search(r"\b(verif(?:ication)?|test\s+matrix|test\s+plan)\b", s, re.I) and re.search(r"\bAC[-_ ]?1\b", s, re.I)):
+        return False, "Spec must include a Verification Matrix referencing `AC-1`."
     return True, "valid"
 
 
-def _read_git_head_approval_hash(abs_root: str, stage_key: str) -> str | None:
+def _read_git_head_approval_hash(abs_root: str, stage_key: str, rel_approvals: str = ".sdlc/approvals.json") -> str | None:
     """Fallback for fresh git clones / worktrees / CI runners where local shadow ledger has no entry yet."""
     try:
         proc = subprocess.run(
-            ["git", "-C", abs_root, "show", "HEAD:.sdlc/approvals.json"],
+            ["git", "-C", abs_root, "show", f"HEAD:{rel_approvals}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -271,8 +346,17 @@ def _read_git_head_approval_hash(abs_root: str, stage_key: str) -> str | None:
         return None
 
 
-def verify_stage_approval(project_root: str, stage_key: str, rel_artifact: str) -> tuple[bool, str]:
+def verify_stage_approval(
+    project_root: str,
+    stage_key: str,
+    rel_artifact: str | None = None,
+    change_id: str | None = None,
+) -> tuple[bool, str]:
     abs_root = os.path.realpath(project_root)
+    art_dir, rel_dir, cid = resolve_artifact_dir(abs_root, change_id)
+    if not rel_artifact:
+        rel_artifact = f"{rel_dir}/{'intent.md' if stage_key == 'S1_PLAN' else 'spec.md'}"
+    rel_approvals = f"{rel_dir}/approvals.json"
     art_path = os.path.join(abs_root, rel_artifact)
     if not os.path.isfile(art_path):
         return False, f"Missing `{rel_artifact}` (`{art_path}`)."
@@ -283,39 +367,41 @@ def verify_stage_approval(project_root: str, stage_key: str, rel_artifact: str) 
         return False, f"Incomplete `{rel_artifact}`: {msg}"
 
     live_hash = file_sha256(art_path)
-    approvals_file = os.path.join(abs_root, ".sdlc", "approvals.json")
+    approvals_file = os.path.join(art_dir, "approvals.json")
+    change_flag = f" --change {cid}" if cid else ""
     if not os.path.isfile(approvals_file):
         return (
             False,
-            f"`{rel_artifact}` (sha256 `{live_hash[:12]}`) is unapproved. Review and run: `python3 .sdlc/bin/verigate.py approve --project . --stage S1_S2`.",
+            f"`{rel_artifact}` (sha256 `{live_hash[:12]}`) is unapproved. Review and run: `python3 .sdlc/bin/verigate.py approve --project .{change_flag} --stage S1_S2`.",
         )
 
     try:
         repo_app = json.loads(Path(approvals_file).read_text(encoding="utf-8"))
     except Exception:
-        return False, "Corrupted `.sdlc/approvals.json`."
+        return False, f"Corrupted `{rel_approvals}`."
 
     repo_entry = (repo_app.get("approvals") or {}).get(stage_key) or {}
     if not repo_entry:
-        return False, f"No approval entry for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve`."
+        return False, f"No approval entry for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve{change_flag}`."
 
+    shadow_key = _shadow_project_key(abs_root, cid)
     shadow_entry = (
-        (((load_shadow_ledger().get("projects") or {}).get(abs_root) or {}).get("approvals") or {}).get(stage_key)
+        (((load_shadow_ledger().get("projects") or {}).get(shadow_key) or {}).get("approvals") or {}).get(stage_key)
         or {}
     )
     trusted_hash = shadow_entry.get("sha256")
     if not trusted_hash:
-        # On a fresh team clone, git worktree, or CI runner, trust HEAD-committed `.sdlc/approvals.json`
-        trusted_hash = _read_git_head_approval_hash(abs_root, stage_key)
+        # On a fresh team clone, git worktree, or CI runner, trust HEAD-committed approvals.json
+        trusted_hash = _read_git_head_approval_hash(abs_root, stage_key, rel_approvals)
 
     if not trusted_hash:
-        return False, f"No verified human approval for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve`."
+        return False, f"No verified human approval for `{stage_key}` (`{rel_artifact}`). Run `verigate.py approve{change_flag}`."
     if repo_entry.get("sha256") != trusted_hash:
-        return False, f"Ledger mismatch for `{rel_artifact}`; re-run `verigate.py approve`."
+        return False, f"Ledger mismatch for `{rel_artifact}`; re-run `verigate.py approve{change_flag}`."
     if live_hash != trusted_hash:
         return (
             False,
-            f"STALE APPROVAL on `{rel_artifact}` (approved `{trusted_hash[:12]}`, current `{live_hash[:12]}`). Re-approve via `verigate.py approve`.",
+            f"STALE APPROVAL on `{rel_artifact}` (approved `{trusted_hash[:12]}`, current `{live_hash[:12]}`). Re-approve via `verigate.py approve{change_flag}`.",
         )
     return True, f"Approved ({live_hash[:12]})"
 
@@ -334,7 +420,7 @@ def classify_prompt(text: str) -> dict | None:
     return None
 
 
-def render_dispatch_table(info: dict) -> str:
+def render_dispatch_table(info: dict, rel_dir: str = ".sdlc") -> str:
     code = info["code"]
     s12 = "🟢 Required + SHA-256 Approval" if info["enforce_spec"] else "⚪ Bypassed"
     s34 = "🟡 On Fix" if code == "review" else ("🔒 Locked until S1+S2 Approved" if info["enforce_spec"] else "🟢 Active")
@@ -345,17 +431,211 @@ def render_dispatch_table(info: dict) -> str:
             "",
             "| Stage | Phase | Role / Agent | Verified Artifact | Gate Status |",
             "| :--- | :--- | :--- | :--- | :--- |",
-            f"| **S1** | Plan | `verigate-requirements` | `.sdlc/intent.md` (`AC-1..AC-N`) | {s12} |",
-            f"| **S2** | Design | `verigate-architect` | `.sdlc/spec.md` (Contracts & Matrix) | {s12} |",
+            f"| **S1** | Plan | `verigate-requirements` | `{rel_dir}/intent.md` (`AC-1..AC-N`) | {s12} |",
+            f"| **S2** | Design | `verigate-architect` | `{rel_dir}/spec.md` (Contracts & Matrix) | {s12} |",
             f"| **S3** | Build | `verigate-builder` | Modular Source Code | {s34} |",
             f"| **S4** | Verify | `verigate-verifier` | Executed Tests (or Logged Waiver) | 🟢 Enforced |",
-            "| **S5** | Review | `verigate-reviewer` + `verigate-sentinel` | `.sdlc/review-findings.json` + `report.md` | 🟢 Enforced |",
+            f"| **S5** | Review | `verigate-reviewer` + `verigate-sentinel` | `{rel_dir}/review-findings.json` + `report.md` | 🟢 Enforced |",
             "| **S6** | Triage | `issue_bridge.py` + Human | GitHub / Azure DevOps + Immediate Fix | 🟢 Dual-Action |",
         ]
     )
 
 
-def evaluate_file_write(path_str: str, session: dict, cwd: str | None = None) -> tuple[str, str]:
+def is_spec_lock_active(proj_root: str, session: dict, change_id: str | None = None) -> bool:
+    abs_root = os.path.realpath(proj_root)
+    art_dir, _rel_dir, _cid = resolve_artifact_dir(abs_root, change_id)
+    cfg_file = os.path.join(abs_root, ".sdlc", "config.json")
+    cfg_enforce = False
+    if os.path.isfile(cfg_file):
+        try:
+            cfg_enforce = bool(json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("require_spec_approval", False))
+        except Exception:
+            pass
+    return (
+        bool(session.get("enforceSpec", False))
+        or cfg_enforce
+        or os.path.isfile(os.path.join(art_dir, "intent.md"))
+        or os.path.isfile(os.path.join(abs_root, ".sdlc", "intent.md"))
+    )
+
+
+def is_real_test_runner_command(cmd: str) -> bool:
+    if not cmd or not cmd.strip():
+        return False
+    for segment in re.split(r"(?:&&|\|\||[;|\n])", cmd):
+        part = segment.strip()
+        if not part:
+            continue
+        if ECHO_OR_PRINT_PREFIX_RE.match(part):
+            continue
+        if TEST_RUNNER_CMD_RE.search(part):
+            return True
+    return False
+
+
+def _strip_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        return token[1:-1]
+    return token
+
+
+def _safe_split(seg: str, posix: bool = True) -> list[str]:
+    try:
+        return shlex.split(seg, posix=posix)
+    except ValueError:
+        return seg.split()
+
+
+def extract_shell_write_targets(cmd: str) -> tuple[bool, list[str]]:
+    """Detect shell/PowerShell file writes and extract target path(s)."""
+    if not cmd or not cmd.strip():
+        return False, []
+    is_write = False
+    targets: list[str] = []
+    null_targets = {"/dev/null", "nul", "$null", "/dev/stdout", "/dev/stderr"}
+
+    for segment in re.split(r"(?:&&|\|\||[;|\n])", cmd):
+        seg = segment.strip()
+        if not seg:
+            continue
+
+        # 1. Shell redirections (> / >>), excluding >& redirects and null sinks
+        for m in re.finditer(r"(?<![>&])(?:[012])?>>?\s*(?!&)(?:[\"']([^\"']+)[\"']|([^\s;|&><'\"]+))", seg):
+            target = (m.group(1) or m.group(2) or "").strip()
+            if target and target.lower() not in null_targets:
+                is_write = True
+                targets.append(target)
+
+        # 2. Inline Python open(..., 'w'/'a')
+        if re.search(r"\bpython(?:3)?\b.*\bopen\s*\([^)]*['\"][wa]", seg, re.IGNORECASE):
+            is_write = True
+            for m in re.finditer(
+                r"\bopen\s*\(\s*r?[\"']([^\"']+)[\"']\s*,\s*(?:mode\s*=\s*)?[\"'][wa]",
+                seg,
+                re.IGNORECASE,
+            ):
+                targets.append(m.group(1))
+
+        # 3. PowerShell write cmdlets (Set-Content, Add-Content, Out-File, Copy-Item, Move-Item)
+        ps_m = PS_WRITE_CMDLET_RE.search(seg)
+        if ps_m:
+            is_write = True
+            cmdlet = ps_m.group(1).lower()
+            param_m = re.search(
+                r"-(?:Path|LiteralPath|FilePath|Destination)\s+(?:[\"']([^\"']+)[\"']|([^\s;|&'\"]+))",
+                seg,
+                re.IGNORECASE,
+            )
+            if param_m:
+                targets.append((param_m.group(1) or param_m.group(2) or "").strip())
+            else:
+                ps_toks = _safe_split(seg, posix=False)
+                idx = next((i for i, t in enumerate(ps_toks) if t.lower() == cmdlet), -1)
+                if idx >= 0:
+                    pos_args: list[str] = []
+                    skip_next = False
+                    for tok in ps_toks[idx + 1 :]:
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        if tok.startswith("-"):
+                            if tok.lower() in ("-value", "-encoding", "-inputobject", "-filter", "-include", "-exclude"):
+                                skip_next = True
+                            continue
+                        pos_args.append(_strip_quotes(tok))
+                    if pos_args:
+                        targets.append(pos_args[-1] if cmdlet in ("copy-item", "move-item") else pos_args[0])
+
+        # 4. POSIX write commands (tee, sed -i, perl -i, cp, mv)
+        toks = _safe_split(seg, posix=True)
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks.pop(0)
+        if not toks:
+            continue
+        prog = os.path.basename(toks[0]).lower()
+        args = toks[1:]
+
+        if prog == "tee":
+            is_write = True
+            for a in args:
+                if not a.startswith("-") and a.lower() not in null_targets:
+                    targets.append(a)
+        elif prog == "sed":
+            if any(a == "-i" or a.startswith("-i") or a == "--in-place" or a.startswith("--in-place=") for a in args):
+                is_write = True
+                pos: list[str] = []
+                has_expr_flag = False
+                skip_next = False
+                for a in args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if a in ("-e", "-f"):
+                        has_expr_flag = True
+                        skip_next = True
+                        continue
+                    if a.startswith("-"):
+                        continue
+                    if a:
+                        pos.append(a)
+                if has_expr_flag and pos:
+                    targets.extend(pos)
+                elif len(pos) >= 2:
+                    targets.extend(pos[1:])
+        elif prog == "perl":
+            if any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+                is_write = True
+                pos = []
+                skip_next = False
+                for a in args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if a in ("-e", "-E", "-I", "-M", "-m"):
+                        skip_next = True
+                        continue
+                    if a.startswith("-"):
+                        continue
+                    if a:
+                        pos.append(a)
+                targets.extend(pos)
+        elif prog in ("cp", "mv"):
+            is_write = True
+            pos = []
+            dest_t = None
+            skip_next = False
+            for a in args:
+                if skip_next:
+                    dest_t = a
+                    skip_next = False
+                    continue
+                if a in ("-t", "--target-directory"):
+                    skip_next = True
+                    continue
+                if a.startswith("-"):
+                    continue
+                pos.append(a)
+            if dest_t:
+                targets.append(dest_t)
+            elif len(pos) >= 2:
+                targets.append(pos[-1])
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in targets:
+        if t and t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return is_write, deduped
+
+
+def evaluate_file_write(
+    path_str: str,
+    session: dict,
+    cwd: str | None = None,
+    change_id: str | None = None,
+) -> tuple[str, str]:
     full_path = normalize_target_path(path_str, cwd)
     norm = full_path.replace("\\", "/")
     base = os.path.basename(norm)
@@ -374,27 +654,24 @@ def evaluate_file_write(path_str: str, session: dict, cwd: str | None = None) ->
         return "allow", ""
 
     proj_root = resolve_project_root(full_path, cwd)
-    cfg_file = os.path.join(proj_root, ".sdlc", "config.json")
-    cfg_enforce = False
-    if os.path.isfile(cfg_file):
-        try:
-            cfg_enforce = bool(json.loads(Path(cfg_file).read_text(encoding="utf-8")).get("require_spec_approval", False))
-        except Exception:
-            pass
-
-    enforce = bool(session.get("enforceSpec", False)) or cfg_enforce or os.path.isfile(os.path.join(proj_root, ".sdlc", "intent.md"))
-    if enforce:
-        ok1, m1 = verify_stage_approval(proj_root, "S1_PLAN", ".sdlc/intent.md")
+    if is_spec_lock_active(proj_root, session, change_id):
+        _art_dir, rel_dir, cid = resolve_artifact_dir(proj_root, change_id)
+        ok1, m1 = verify_stage_approval(proj_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
         if not ok1:
             return "deny", f"[VeriGate S1 Gate] Blocked `{base}`: {m1}"
-        ok2, m2 = verify_stage_approval(proj_root, "S2_DESIGN", ".sdlc/spec.md")
+        ok2, m2 = verify_stage_approval(proj_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
         if not ok2:
             return "deny", f"[VeriGate S2 Gate] Blocked `{base}`: {m2}"
 
     return "allow", ""
 
 
-def evaluate_shell_command(cmd: str) -> tuple[str, str]:
+def evaluate_shell_command(
+    cmd: str,
+    session: dict | None = None,
+    cwd: str | None = None,
+    change_id: str | None = None,
+) -> tuple[str, str]:
     if GIT_NO_VERIFY_RE.search(cmd):
         return "deny", "[VeriGate Integrity Gate] Bypassing git hooks with `--no-verify` / `-n` is blocked."
 
@@ -409,9 +686,9 @@ def evaluate_shell_command(cmd: str) -> tuple[str, str]:
             if subcmd in ("status", "validate", "dispatch", "merge-check"):
                 return "allow", ""
             if subcmd == "approve":
-                return "force_ask", "[VeriGate Approval Gate] Confirm human review of `.sdlc/intent.md` & `.sdlc/spec.md` SHA-256 digests."
+                return "force_ask", "[VeriGate Approval Gate] Confirm human review of intent & spec SHA-256 digests."
             if subcmd == "waive":
-                return "force_ask", "[VeriGate Waiver Gate] Confirm recording a logged Stage Waiver in `.sdlc/waivers.jsonl`."
+                return "force_ask", "[VeriGate Waiver Gate] Confirm recording a logged Stage Waiver in `waivers.jsonl`."
 
     if ANY_VERIGATE_INVOCATION_RE.search(cmd):
         return (
@@ -425,18 +702,34 @@ def evaluate_shell_command(cmd: str) -> tuple[str, str]:
     if EXTERNAL_MUTATION_CMD_RE.search(cmd):
         return "force_ask", "[VeriGate External Gate] Creating GitHub/Azure DevOps tickets, PRs, or pushing requires human confirmation."
 
+    is_write, targets = extract_shell_write_targets(cmd)
+    if is_write:
+        non_meta = [t for t in targets if not is_meta_or_doc_path(normalize_target_path(t, cwd))]
+        if non_meta or not targets:
+            anchor = non_meta[0] if non_meta else ""
+            proj_root = resolve_project_root(anchor, cwd)
+            if is_spec_lock_active(proj_root, session or {}, change_id):
+                _art_dir, rel_dir, cid = resolve_artifact_dir(proj_root, change_id)
+                label = os.path.basename(non_meta[0].replace("\\", "/")) if non_meta else "source file"
+                ok1, m1 = verify_stage_approval(proj_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
+                if not ok1:
+                    return "deny", f"[VeriGate S1 Shell Write Gate] Blocked shell write to `{label}`: {m1}"
+                ok2, m2 = verify_stage_approval(proj_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
+                if not ok2:
+                    return "deny", f"[VeriGate S2 Shell Write Gate] Blocked shell write to `{label}`: {m2}"
+
     return "allow", ""
 
 
 # --- CLI Actions ---
 
 
-def cmd_init(project_root: str, require_spec: bool) -> int:
+def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None) -> int:
     sdlc = Path(project_root) / ".sdlc"
     sdlc.mkdir(parents=True, exist_ok=True)
     cfg = sdlc / "config.json"
     if not cfg.exists():
-        cfg.write_text(json.dumps({"require_spec_approval": require_spec, "version": "2.3.0"}, indent=2) + "\n", encoding="utf-8")
+        cfg.write_text(json.dumps({"require_spec_approval": require_spec, "version": "2.4.0"}, indent=2) + "\n", encoding="utf-8")
     policy = sdlc / "policy.json"
     if not policy.exists():
         policy.write_text(
@@ -458,18 +751,29 @@ def cmd_init(project_root: str, require_spec: bool) -> int:
         rev.write_text(
             "# Governed Code Review Policy (`REVIEW.md`)\n\n"
             "- **Critical**: Auth bypass, secret exposure, injection, data loss, crash on primary flow.\n"
-            "- **High**: Violated `AC-*` in `.sdlc/intent.md`, contract drift from `.sdlc/spec.md`, missing tests.\n"
+            "- **High**: Violated `AC-*` in `intent.md`, contract drift from `spec.md`, missing tests.\n"
             "- **Medium**: Performance bottleneck, incomplete boundary validation.\n"
             "- **Low**: Readability, naming, minor tech debt.\n",
             encoding="utf-8",
         )
-    print(json.dumps({"status": "initialized", "sdlc_dir": str(sdlc)}, indent=2))
+
+    art_dir, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
+    Path(art_dir).mkdir(parents=True, exist_ok=True)
+    if change_id:
+        (sdlc / "active-change").write_text(f"{cid}\n", encoding="utf-8")
+
+    out: dict = {"status": "initialized", "sdlc_dir": str(sdlc), "artifact_dir": rel_dir}
+    if cid:
+        out["change_id"] = cid
+    print(json.dumps(out, indent=2))
     return 0
 
 
-def cmd_merge_check(project_root: str) -> int:
+def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
     """Deterministic Team Policy Approval Gate: Review (0 open findings) + Spec SHA-256 -> Ready to Merge."""
     sdlc = Path(project_root) / ".sdlc"
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
+    art_dir = Path(art_dir_str)
     policy_file = sdlc / "policy.json"
     policy = {
         "require_zero_findings": True,
@@ -486,20 +790,20 @@ def cmd_merge_check(project_root: str) -> int:
 
     reasons: list[str] = []
 
-    if (sdlc / "intent.md").is_file():
-        ok1, m1 = verify_stage_approval(project_root, "S1_PLAN", ".sdlc/intent.md")
+    if (art_dir / "intent.md").is_file():
+        ok1, m1 = verify_stage_approval(project_root, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
         if not ok1:
             reasons.append(f"S1_PLAN: {m1}")
-        ok2, m2 = verify_stage_approval(project_root, "S2_DESIGN", ".sdlc/spec.md")
+        ok2, m2 = verify_stage_approval(project_root, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
         if not ok2:
             reasons.append(f"S2_DESIGN: {m2}")
 
-    findings_file = sdlc / "review-findings.json"
+    findings_file = art_dir / "review-findings.json"
     open_count = -1
     score = 0
     verdict = "MISSING"
     if not findings_file.is_file():
-        reasons.append("Missing `.sdlc/review-findings.json` from Stage 5 Code Review.")
+        reasons.append(f"Missing `{rel_dir}/review-findings.json` from Stage 5 Code Review.")
     else:
         try:
             report = json.loads(findings_file.read_text(encoding="utf-8"))
@@ -522,47 +826,50 @@ def cmd_merge_check(project_root: str) -> int:
             if score < int(policy.get("min_quality_score", 85)):
                 reasons.append(f"Quality score {score} is below team policy minimum ({policy.get('min_quality_score', 85)}).")
         except Exception as exc:
-            reasons.append(f"Invalid `.sdlc/review-findings.json`: {exc}")
+            reasons.append(f"Invalid `{rel_dir}/review-findings.json`: {exc}")
 
     ready = len(reasons) == 0
     status = "READY_TO_MERGE" if ready else "BLOCKED_BY_POLICY"
     append_audit(
         project_root,
         "MERGE_POLICY_APPROVED" if ready else "MERGE_POLICY_BLOCKED",
-        {"status": status, "verdict": verdict, "quality_score": score, "open_findings": open_count, "reasons": reasons},
+        {"status": status, "change_id": cid, "verdict": verdict, "quality_score": score, "open_findings": open_count, "reasons": reasons},
     )
-    print(
-        json.dumps(
-            {
-                "status": status,
-                "ready_to_merge": ready,
-                "verdict": verdict,
-                "quality_score": score,
-                "open_findings": open_count,
-                "policy": policy,
-                "blocking_reasons": reasons,
-            },
-            indent=2,
-        )
-    )
+    out = {
+        "status": status,
+        "ready_to_merge": ready,
+        "artifact_dir": rel_dir,
+        "verdict": verdict,
+        "quality_score": score,
+        "open_findings": open_count,
+        "policy": policy,
+        "blocking_reasons": reasons,
+    }
+    if cid:
+        out["change_id"] = cid
+    print(json.dumps(out, indent=2))
     return 0 if ready else 1
 
 
-def cmd_approve(project_root: str, stage: str, approver: str, note: str) -> int:
+def cmd_approve(project_root: str, stage: str, approver: str, note: str, change_id: str | None = None) -> int:
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
+    art_dir = Path(art_dir_str)
     stage_map = {
-        "S1_PLAN": [("S1_PLAN", ".sdlc/intent.md")],
-        "S2_DESIGN": [("S2_DESIGN", ".sdlc/spec.md")],
-        "S1_S2": [("S1_PLAN", ".sdlc/intent.md"), ("S2_DESIGN", ".sdlc/spec.md")],
+        "S1_PLAN": [("S1_PLAN", f"{rel_dir}/intent.md")],
+        "S2_DESIGN": [("S2_DESIGN", f"{rel_dir}/spec.md")],
+        "S1_S2": [("S1_PLAN", f"{rel_dir}/intent.md"), ("S2_DESIGN", f"{rel_dir}/spec.md")],
     }
-    sdlc = Path(project_root) / ".sdlc"
-    sdlc.mkdir(parents=True, exist_ok=True)
-    app_file = sdlc / "approvals.json"
-    repo_data = json.loads(app_file.read_text(encoding="utf-8")) if app_file.is_file() else {"version": "2.2.0", "approvals": {}}
+    art_dir.mkdir(parents=True, exist_ok=True)
+    app_file = art_dir / "approvals.json"
+    repo_data = json.loads(app_file.read_text(encoding="utf-8")) if app_file.is_file() else {"version": "2.4.0", "approvals": {}}
     repo_data.pop("project_root", None)
     repo_data.setdefault("approvals", {})
+    if cid:
+        repo_data["change_id"] = cid
 
     shadow = load_shadow_ledger()
-    proj_sh = shadow.setdefault("projects", {}).setdefault(project_root, {"approvals": {}, "waivers": []})
+    shadow_key = _shadow_project_key(os.path.realpath(project_root), cid)
+    proj_sh = shadow.setdefault("projects", {}).setdefault(shadow_key, {"approvals": {}, "waivers": []})
     now = utc_now_iso()
     approved = []
 
@@ -580,22 +887,26 @@ def cmd_approve(project_root: str, stage: str, approver: str, note: str) -> int:
         repo_data["approvals"][st_key] = entry
         proj_sh["approvals"][st_key] = entry
         approved.append({"stage": st_key, **entry})
-        append_audit(project_root, "STAGE_CONTENT_APPROVED", {"stage": st_key, "artifact": rel, "sha256": digest, "approved_by": approver})
+        append_audit(project_root, "STAGE_CONTENT_APPROVED", {"stage": st_key, "change_id": cid, "artifact": rel, "sha256": digest, "approved_by": approver})
 
     tmp = f"{app_file}.tmp"
     Path(tmp).write_text(json.dumps(repo_data, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, app_file)
     save_shadow_ledger(shadow)
-    print(json.dumps({"status": "approved", "approved": approved}, indent=2))
+    out: dict = {"status": "approved", "artifact_dir": rel_dir, "approved": approved}
+    if cid:
+        out["change_id"] = cid
+    print(json.dumps(out, indent=2))
     return 0
 
 
-def cmd_waive(project_root: str, stage: str, reason: str) -> int:
+def cmd_waive(project_root: str, stage: str, reason: str, change_id: str | None = None) -> int:
     if len(reason.strip()) < 8:
         print(json.dumps({"status": "error", "error": "Waiver `--reason` must be >=8 chars."}))
         return 1
-    sdlc = Path(project_root) / ".sdlc"
-    sdlc.mkdir(parents=True, exist_ok=True)
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=True)
+    art_dir = Path(art_dir_str)
+    art_dir.mkdir(parents=True, exist_ok=True)
     digests = {}
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in {".git", ".sdlc", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}]
@@ -607,21 +918,27 @@ def cmd_waive(project_root: str, stage: str, reason: str) -> int:
                     digests[fp] = d
 
     rec = {"waived_at": utc_now_iso(), "stage": stage, "reason": reason.strip(), "files": digests}
-    with open(sdlc / "waivers.jsonl", "a", encoding="utf-8") as fh:
+    if cid:
+        rec["change_id"] = cid
+    with open(art_dir / "waivers.jsonl", "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec) + "\n")
 
     shadow = load_shadow_ledger()
-    shadow.setdefault("projects", {}).setdefault(project_root, {"approvals": {}, "waivers": []}).setdefault("waivers", []).append(rec)
+    shadow_key = _shadow_project_key(os.path.realpath(project_root), cid)
+    shadow.setdefault("projects", {}).setdefault(shadow_key, {"approvals": {}, "waivers": []}).setdefault("waivers", []).append(rec)
     save_shadow_ledger(shadow)
-    append_audit(project_root, "STAGE_WAIVER_APPROVED", {"stage": stage, "reason": reason.strip(), "file_count": len(digests)})
-    print(json.dumps({"status": "waived", "stage": stage, "waived_file_count": len(digests)}, indent=2))
+    append_audit(project_root, "STAGE_WAIVER_APPROVED", {"stage": stage, "change_id": cid, "reason": reason.strip(), "file_count": len(digests)})
+    out: dict = {"status": "waived", "stage": stage, "artifact_dir": rel_dir, "waived_file_count": len(digests)}
+    if cid:
+        out["change_id"] = cid
+    print(json.dumps(out, indent=2))
     return 0
 
 
 # --- Multi-Harness Hook Protocol Adapter ---
 
 
-def handle_hook(adapter: str, event_override: str | None) -> int:
+def handle_hook(adapter: str, event_override: str | None, change_id: str | None = None) -> int:
     if adapter == "git-pre-commit":
         proj = resolve_project_root(".", os.getcwd())
         proc = subprocess.run(
@@ -633,7 +950,7 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
         for sp in staged:
             if PROTECTED_LEDGER_RE.search(sp.replace("\\", "/")):
                 continue
-            decision, reason = evaluate_file_write(sp, {}, proj)
+            decision, reason = evaluate_file_write(sp, {}, proj, change_id=change_id)
             if decision == "deny":
                 sys.stderr.write(f"\n❌ {reason}\n")
                 return 1
@@ -672,7 +989,9 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
             return 0
         session["enforceSpec"] = info["enforce_spec"]
         save_session(session_id, session)
-        table_md = render_dispatch_table(info)
+        proj = resolve_project_root("", cwd)
+        _art_dir, rel_dir, _cid = resolve_artifact_dir(proj, change_id)
+        table_md = render_dispatch_table(info, rel_dir=rel_dir)
         if adapter == "claude":
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": table_md}}))
         else:
@@ -696,10 +1015,11 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
         if adapter == "claude":
             tname = payload.get("tool_name") or ""
             tinput = payload.get("tool_input") or {}
-            if tname in ("Write", "Edit", "MultiEdit"):
-                decision, reason = evaluate_file_write(str(tinput.get("file_path") or ""), session, cwd)
-            elif tname == "Bash":
-                decision, reason = evaluate_shell_command(str(tinput.get("command") or ""))
+            if tname in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                target_file = str(tinput.get("file_path") or tinput.get("notebook_path") or "")
+                decision, reason = evaluate_file_write(target_file, session, cwd, change_id=change_id)
+            elif tname in ("Bash", "PowerShell"):
+                decision, reason = evaluate_shell_command(str(tinput.get("command") or ""), session, cwd, change_id=change_id)
             else:
                 decision, reason = "allow", ""
             claude_dec = "ask" if decision in ("ask", "force_ask") else decision
@@ -718,9 +1038,9 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
             except ValueError:
                 targs = {}
         if tname in ("write_file", "edit_file"):
-            decision, reason = evaluate_file_write(str(targs.get("Path") or ""), session, cwd)
+            decision, reason = evaluate_file_write(str(targs.get("Path") or ""), session, cwd, change_id=change_id)
         elif tname == "run_command":
-            decision, reason = evaluate_shell_command(str(targs.get("CommandLine") or ""))
+            decision, reason = evaluate_shell_command(str(targs.get("CommandLine") or ""), session, cwd, change_id=change_id)
         else:
             decision, reason = "allow", ""
         out = {"decision": decision}
@@ -736,13 +1056,32 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
             tname = payload.get("tool_name") or ""
             tinput = payload.get("tool_input") or {}
             tresp = payload.get("tool_response") or {}
-            if isinstance(tresp, dict) and tresp.get("exit_code") not in (None, 0):
-                cmd_failed = True
-            path = str(tinput.get("file_path") or "") if tname in ("Write", "Edit", "MultiEdit") else ""
-            if tname == "Bash":
+            if isinstance(tresp, dict):
+                ec = tresp.get("exit_code")
+                if ec is None:
+                    ec = tresp.get("exitCode")
+                if ec not in (None, 0) or tresp.get("is_error") or tresp.get("isError"):
+                    cmd_failed = True
+            path = (
+                str(tinput.get("file_path") or tinput.get("notebook_path") or "")
+                if tname in ("Write", "Edit", "MultiEdit", "NotebookEdit")
+                else ""
+            )
+            if tname in ("Bash", "PowerShell"):
                 cmd_str = str(tinput.get("command") or "")
-            sub_agent = str(tinput.get("subagent_type") or "") if tname == "Task" else ""
+            sub_agent = (
+                str(tinput.get("subagent_type") or tinput.get("agent") or tinput.get("name") or "")
+                if tname in ("Task", "Agent")
+                else ""
+            )
         else:
+            tresp = payload.get("toolResponse") or payload.get("result") or {}
+            if isinstance(tresp, dict):
+                ec = tresp.get("exit_code")
+                if ec is None:
+                    ec = tresp.get("exitCode")
+                if ec not in (None, 0):
+                    cmd_failed = True
             if cmd_failed:
                 print("{}")
                 return 0
@@ -771,11 +1110,37 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
                 session["dirtyFiles"] = dirty[-25:]
                 session["verified"] = False
                 session["reviewed"] = False
-        elif cmd_str and not cmd_failed and dirty and TEST_RUNNER_CMD_RE.search(cmd_str):
-            session["verified"] = True
-        elif not cmd_failed and "verifier" in sub_agent:
-            session["verified"] = True
-        elif not cmd_failed and "reviewer" in sub_agent:
+        elif cmd_str and not cmd_failed:
+            is_write, targets = extract_shell_write_targets(cmd_str)
+            wrote_source = False
+            if is_write:
+                non_meta_paths: list[str] = []
+                for t in targets:
+                    full_p = os.path.realpath(normalize_target_path(t, cwd))
+                    norm = full_p.replace("\\", "/")
+                    if REVIEW_ARTIFACT_RE.search(norm):
+                        session["reviewed"] = True
+                    elif not is_meta_or_doc_path(full_p):
+                        non_meta_paths.append(full_p)
+                if non_meta_paths:
+                    wrote_source = True
+                    for fp in non_meta_paths:
+                        if fp not in dirty:
+                            dirty.append(fp)
+                    session["dirtyFiles"] = dirty[-25:]
+                    session["verified"] = False
+                    session["reviewed"] = False
+                elif not targets:
+                    wrote_source = True
+                    marker = os.path.realpath(cwd)
+                    if marker not in dirty:
+                        dirty.append(marker)
+                    session["dirtyFiles"] = dirty[-25:]
+                    session["verified"] = False
+                    session["reviewed"] = False
+            if not wrote_source and dirty and is_real_test_runner_command(cmd_str):
+                session["verified"] = True
+        elif not cmd_failed and "reviewer" in sub_agent.lower():
             session["reviewed"] = True
 
         save_session(session_id, session)
@@ -788,10 +1153,15 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
             print(json.dumps({"decision": "allow"} if adapter == "antigravity" else {}))
             return 0
         proj = resolve_project_root(dirty[0], cwd)
+        _art_dir, rel_dir, cid = resolve_artifact_dir(proj, change_id)
         verified = bool(session.get("verified", True))
         reviewed = bool(session.get("reviewed", True))
 
-        shadow_waivers = (((load_shadow_ledger().get("projects") or {}).get(proj) or {}).get("waivers")) or []
+        projects_sh = load_shadow_ledger().get("projects") or {}
+        shadow_waivers = list(((projects_sh.get(_shadow_project_key(proj, cid)) or {}).get("waivers")) or [])
+        if cid:
+            shadow_waivers.extend(((projects_sh.get(proj) or {}).get("waivers")) or [])
+
         live_digests = {}
         all_exist = True
         for p in dirty:
@@ -823,19 +1193,20 @@ def handle_hook(adapter: str, event_override: str | None) -> int:
         if intercepts < MAX_STOP_INTERCEPTS and not stop_hook_active:
             session["stopIntercepts"] = intercepts + 1
             save_session(session_id, session)
+            change_flag = f" --change {cid}" if cid else ""
             msg = (
                 "[VeriGate AI-SDLC Stop Gate] Modified source files require S4 Verification (tests) AND S5 Code Review "
-                "(`.sdlc/review-findings.json` + `.sdlc/review-report.md`). If blocked by a missing tool/runtime, request a logged waiver: "
-                f'`python3 .sdlc/bin/verigate.py waive --project "{proj}" --stage ALL --reason "<blocker>"`.'
+                f"(`{rel_dir}/review-findings.json` + `{rel_dir}/review-report.md`). If blocked by a missing tool/runtime, request a logged waiver: "
+                f'`python3 .sdlc/bin/verigate.py waive --project "{proj}"{change_flag} --stage ALL --reason "<blocker>"`.'
             )
-            append_audit(proj, "STOP_GATE_INTERCEPT", {"session_id": session_id})
+            append_audit(proj, "STOP_GATE_INTERCEPT", {"session_id": session_id, "change_id": cid})
             if adapter == "claude":
                 print(json.dumps({"decision": "block", "reason": msg}))
             else:
                 print(json.dumps({"decision": "continue", "reason": msg}))
             return 0
 
-        append_audit(proj, "STOP_GATE_CIRCUIT_BREAKER_TRIPPED", {"session_id": session_id, "files": live_digests})
+        append_audit(proj, "STOP_GATE_CIRCUIT_BREAKER_TRIPPED", {"session_id": session_id, "change_id": cid, "files": live_digests})
         session["dirtyFiles"] = []
         session["stopIntercepts"] = 0
         save_session(session_id, session)
@@ -853,62 +1224,86 @@ def main() -> None:
     p_init = sub.add_parser("init")
     p_init.add_argument("--project", default=".")
     p_init.add_argument("--require-spec", action="store_true")
+    p_init.add_argument("--change", default=None)
 
     p_disp = sub.add_parser("dispatch")
     p_disp.add_argument("prompt")
 
     p_val = sub.add_parser("validate")
     p_val.add_argument("--project", default=".")
+    p_val.add_argument("--change", default=None)
 
     p_app = sub.add_parser("approve")
     p_app.add_argument("--project", default=".")
     p_app.add_argument("--stage", choices=["S1_PLAN", "S2_DESIGN", "S1_S2"], default="S1_S2")
     p_app.add_argument("--approver", default="human_validator")
     p_app.add_argument("--note", default="")
+    p_app.add_argument("--change", default=None)
 
     p_waive = sub.add_parser("waive")
     p_waive.add_argument("--project", default=".")
     p_waive.add_argument("--stage", choices=["S4_TEST", "S5_REVIEW", "ALL"], default="ALL")
     p_waive.add_argument("--reason", required=True)
+    p_waive.add_argument("--change", default=None)
 
     p_stat = sub.add_parser("status")
     p_stat.add_argument("--project", default=".")
+    p_stat.add_argument("--change", default=None)
 
     p_merge = sub.add_parser("merge-check")
     p_merge.add_argument("--project", default=".")
+    p_merge.add_argument("--change", default=None)
 
     p_hook = sub.add_parser("hook")
     p_hook.add_argument("--adapter", choices=["auto", "antigravity", "claude", "git-pre-commit"], default="auto")
     p_hook.add_argument("--event", default=None)
+    p_hook.add_argument("--change", default=None)
 
     args = parser.parse_args()
 
-    if args.cmd == "init":
-        sys.exit(cmd_init(os.path.realpath(args.project), args.require_spec))
-    if args.cmd == "dispatch":
-        info = classify_prompt(args.prompt) or {"profile": "General Engineering", "code": "change", "enforce_spec": False}
-        print(render_dispatch_table(info))
-        sys.exit(0)
-    if args.cmd == "validate":
-        proj = os.path.realpath(args.project)
-        ok1, m1 = verify_stage_approval(proj, "S1_PLAN", ".sdlc/intent.md")
-        ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", ".sdlc/spec.md")
-        print(json.dumps({"S1_PLAN": m1, "S2_DESIGN": m2, "ready_for_build": bool(ok1 and ok2)}, indent=2))
-        sys.exit(0 if (ok1 and ok2) else 1)
-    if args.cmd == "approve":
-        sys.exit(cmd_approve(os.path.realpath(args.project), args.stage, args.approver, args.note))
-    if args.cmd == "waive":
-        sys.exit(cmd_waive(os.path.realpath(args.project), args.stage, args.reason))
-    if args.cmd == "status":
-        proj = os.path.realpath(args.project)
-        ok1, m1 = verify_stage_approval(proj, "S1_PLAN", ".sdlc/intent.md")
-        ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", ".sdlc/spec.md")
-        print(json.dumps({"project_root": proj, "S1_PLAN": {"approved": ok1, "detail": m1}, "S2_DESIGN": {"approved": ok2, "detail": m2}}, indent=2))
-        sys.exit(0)
-    if args.cmd == "merge-check":
-        sys.exit(cmd_merge_check(os.path.realpath(args.project)))
-    if args.cmd == "hook":
-        sys.exit(handle_hook(args.adapter, args.event))
+    try:
+        if args.cmd == "init":
+            sys.exit(cmd_init(os.path.realpath(args.project), args.require_spec, change_id=args.change))
+        if args.cmd == "dispatch":
+            info = classify_prompt(args.prompt) or {"profile": "General Engineering", "code": "change", "enforce_spec": False}
+            print(render_dispatch_table(info))
+            sys.exit(0)
+        if args.cmd == "validate":
+            proj = os.path.realpath(args.project)
+            _art_dir, rel_dir, cid = resolve_artifact_dir(proj, args.change, strict=True)
+            ok1, m1 = verify_stage_approval(proj, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
+            ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
+            out: dict = {"artifact_dir": rel_dir, "S1_PLAN": m1, "S2_DESIGN": m2, "ready_for_build": bool(ok1 and ok2)}
+            if cid:
+                out["change_id"] = cid
+            print(json.dumps(out, indent=2))
+            sys.exit(0 if (ok1 and ok2) else 1)
+        if args.cmd == "approve":
+            sys.exit(cmd_approve(os.path.realpath(args.project), args.stage, args.approver, args.note, change_id=args.change))
+        if args.cmd == "waive":
+            sys.exit(cmd_waive(os.path.realpath(args.project), args.stage, args.reason, change_id=args.change))
+        if args.cmd == "status":
+            proj = os.path.realpath(args.project)
+            _art_dir, rel_dir, cid = resolve_artifact_dir(proj, args.change, strict=True)
+            ok1, m1 = verify_stage_approval(proj, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
+            ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
+            out = {
+                "project_root": proj,
+                "artifact_dir": rel_dir,
+                "S1_PLAN": {"approved": ok1, "detail": m1},
+                "S2_DESIGN": {"approved": ok2, "detail": m2},
+            }
+            if cid:
+                out["change_id"] = cid
+            print(json.dumps(out, indent=2))
+            sys.exit(0)
+        if args.cmd == "merge-check":
+            sys.exit(cmd_merge_check(os.path.realpath(args.project), change_id=args.change))
+        if args.cmd == "hook":
+            sys.exit(handle_hook(args.adapter, args.event, change_id=args.change))
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

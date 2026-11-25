@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (`REV-001`..`REV-007`).
+"""Bundled zero-dependency unittest suite for VeriGate AI-SDLC (v2.4 audit-hardened).
 
 Run with:
     python3 -m unittest discover -s tests -v
@@ -19,6 +19,32 @@ import unittest
 
 KIT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+VALID_INTENT_MD = (
+    "# Billing Service Intent\n\n"
+    "## Scope\n"
+    "Implement multi-tenant invoice generation with strict tenant isolation, idempotency keys, "
+    "and deterministic audit logging for every API request.\n\n"
+    "## Constraints & Non-Goals\n"
+    "- No cross-tenant reads or shared mutable state.\n"
+    "- Out of scope: payment processor settlement retries.\n\n"
+    "## Acceptance Criteria\n"
+    "- AC-1: Return HTTP 200 with a tenant-scoped invoice JSON payload.\n"
+    "- AC-2: Reject cross-tenant invoice access with HTTP 403 and zero data leakage.\n"
+)
+
+VALID_SPEC_MD = (
+    "# Billing Architecture Spec\n\n"
+    "## Architecture & Module Contracts\n"
+    "Module `src/app.py` defines the invoice handler schema, idempotency store interface, "
+    "and tenant authorization contract enforced at the service boundary.\n\n"
+    "## Security & Guardrails\n"
+    "All requests validate signed tenant JWT claims before querying storage. Secrets are "
+    "injected via environment variables and never persisted in repository files.\n\n"
+    "## Verification Matrix\n"
+    "- AC-1 -> unit test `test_tenant_invoice_200`\n"
+    "- AC-2 -> security test `test_cross_tenant_403`\n"
+)
+
 
 def _load_module(name: str, path: pathlib.Path):
     spec = importlib.util.spec_from_file_location(name, str(path))
@@ -35,6 +61,7 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.repo.mkdir()
         self.env = os.environ.copy()
         self.env["VERIGATE_DATA_DIR"] = str(self.tmp_dir / "shadow")
+        self.env.pop("VERIGATE_CHANGE", None)
 
         subprocess.run(["git", "init", str(self.repo)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "ci@example.com"], check=True)
@@ -52,14 +79,14 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    def _hook(self, payload: dict, raw_override: str | None = None) -> dict:
+    def _hook(self, payload: dict, raw_override: str | None = None, env_override: dict | None = None) -> dict:
         p = subprocess.run(
             [sys.executable, str(self.aisdlc_bin), "hook", "--adapter", "auto"],
             input=raw_override if raw_override is not None else json.dumps(payload),
             text=True,
             capture_output=True,
             cwd=str(self.repo),
-            env=self.env,
+            env=env_override if env_override is not None else self.env,
         )
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
@@ -109,14 +136,8 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertEqual(len(merged_cfg["hooks"]["PreToolUse"]), 1)
 
         # Author & approve S1+S2, commit to git, then simulate a teammate's fresh clone (empty shadow ledger!)
-        (self.repo / ".sdlc/intent.md").write_text(
-            "# Billing Service Intent\nScope: Multi-tenant invoice generation with strict tenant isolation and idempotency.\n- AC-1: Return HTTP 200 with tenant-scoped invoice JSON payload.\n",
-            encoding="utf-8",
-        )
-        (self.repo / ".sdlc/spec.md").write_text(
-            "# Billing Architecture Spec\nModule `src/app.py` defines the invoice handler schema and tenant authorization contract.\n## Verification Matrix\n- AC-1 -> unit test `test_tenant_invoice_200`\n",
-            encoding="utf-8",
-        )
+        (self.repo / ".sdlc/intent.md").write_text(VALID_INTENT_MD, encoding="utf-8")
+        (self.repo / ".sdlc/spec.md").write_text(VALID_SPEC_MD, encoding="utf-8")
         subprocess.run([sys.executable, str(self.aisdlc_bin), "approve", "--project", str(self.repo), "--stage", "S1_S2"], check=True, capture_output=True, env=self.env)
         (self.repo / "src").mkdir()
         (self.repo / "src/app.py").write_text("x = 1\n", encoding="utf-8")
@@ -148,7 +169,7 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertEqual(s_block["decision"], "block")
 
         # Real test runner (`python3 -m unittest`) marks verified=True -> Stop allows!
-        self._hook({"session_id": "s6", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "python3 -m unittest"}, "cwd": str(self.repo)})
+        self._hook({"session_id": "s6", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "python3 -m unittest"}, "tool_response": {"exit_code": 0}, "cwd": str(self.repo)})
         s_ok = self._hook({"session_id": "s6", "hook_event_name": "Stop", "stop_hook_active": True, "cwd": str(self.repo)})
         self.assertEqual(s_ok, {})
 
@@ -234,6 +255,290 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertEqual(d3["status"], "READY_TO_MERGE")
         self.assertTrue(d3["ready_to_merge"])
         self.assertEqual(d3["open_findings"], 0)
+
+    def test_gap1_shell_writes_blocked_and_tracked(self) -> None:
+        # Spec lock is ON (--require-spec in setUp) and S1/S2 not approved yet.
+        # Shell writes must be denied in PreToolUse.
+        shell_cmds = [
+            "sed -i 's/a/b/g' src/app.py",
+            "cat > src/app.py",
+            "python3 -c \"open('src/app.py','w').write('x=1')\"",
+        ]
+        for cmd in shell_cmds:
+            res = self._hook(
+                {"session_id": "gap1", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(self.repo)}
+            )
+            self.assertEqual(res["hookSpecificOutput"]["permissionDecision"], "deny", f"Expected deny for: {cmd}")
+
+        # In PostToolUse, a shell write to a source file must mark dirtyFiles and reset verified/reviewed
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src/app.py").write_text("x = 1\n", encoding="utf-8")
+        self._hook(
+            {
+                "session_id": "gap1-post",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat > src/app.py"},
+                "tool_response": {"exit_code": 0},
+                "cwd": str(self.repo),
+            }
+        )
+        s_block = self._hook({"session_id": "gap1-post", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_block["decision"], "block")
+
+        # Also verify python3 -c open(...,'w') resets verified after a previous test pass
+        self._hook(
+            {
+                "session_id": "gap1-post2",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python3 -c \"open('src/app.py','w').write('x=2')\""},
+                "tool_response": {"exit_code": 0},
+                "cwd": str(self.repo),
+            }
+        )
+        self._hook({"session_id": "gap1-post2", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+        s_block2 = self._hook({"session_id": "gap1-post2", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_block2["decision"], "block")
+
+    def test_gap2_powershell_and_notebook_edit_gates(self) -> None:
+        # Check .claude/settings.json matchers include PowerShell and NotebookEdit
+        claude_cfg = json.loads((self.repo / ".claude/settings.json").read_text(encoding="utf-8"))
+        pre_matcher = claude_cfg["hooks"]["PreToolUse"][0]["matcher"]
+        post_matcher = claude_cfg["hooks"]["PostToolUse"][0]["matcher"]
+        for tool in ("PowerShell", "NotebookEdit"):
+            self.assertIn(tool, pre_matcher)
+            self.assertIn(tool, post_matcher)
+
+        # PowerShell source writes denied under spec lock
+        for ps_cmd in (
+            "Set-Content -Path src/app.py -Value 'x=1'",
+            "'x=1' | Out-File -FilePath src/app.py",
+        ):
+            r_ps = self._hook(
+                {"session_id": "gap2", "hook_event_name": "PreToolUse", "tool_name": "PowerShell", "tool_input": {"command": ps_cmd}, "cwd": str(self.repo)}
+            )
+            self.assertEqual(r_ps["hookSpecificOutput"]["permissionDecision"], "deny", f"Expected deny for: {ps_cmd}")
+
+        # NotebookEdit denied under spec lock
+        r_nb = self._hook(
+            {"session_id": "gap2", "hook_event_name": "PreToolUse", "tool_name": "NotebookEdit", "tool_input": {"notebook_path": "notebooks/analysis.ipynb"}, "cwd": str(self.repo)}
+        )
+        self.assertEqual(r_nb["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # PowerShell ledger edits and secret edits always denied
+        for tamper_cmd in (
+            "Set-Content -Path .sdlc\\approvals.json -Value '{}'",
+            "'{}' | Out-File .sdlc/approvals.json",
+            "Remove-Item .sdlc\\approvals.json",
+            "Set-Content -Path .env -Value 'SECRET=1'",
+        ):
+            r_tamper = self._hook(
+                {"session_id": "gap2", "hook_event_name": "PreToolUse", "tool_name": "PowerShell", "tool_input": {"command": tamper_cmd}, "cwd": str(self.repo)}
+            )
+            self.assertEqual(r_tamper["hookSpecificOutput"]["permissionDecision"], "deny", f"Expected deny for: {tamper_cmd}")
+
+        # NotebookEdit tracked in PostToolUse
+        (self.repo / "notebooks").mkdir(exist_ok=True)
+        (self.repo / "notebooks/analysis.ipynb").write_text("{}", encoding="utf-8")
+        self._hook(
+            {"session_id": "gap2-nb", "hook_event_name": "PostToolUse", "tool_name": "NotebookEdit", "tool_input": {"notebook_path": "notebooks/analysis.ipynb"}, "cwd": str(self.repo)}
+        )
+        self._hook({"session_id": "gap2-nb", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+        s_nb = self._hook({"session_id": "gap2-nb", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_nb["decision"], "block")
+
+    def test_gap3_and_gap8_real_test_exit_codes_and_agent_tool(self) -> None:
+        # Gap #8: Agent tool in Claude PostToolUse matcher
+        claude_cfg = json.loads((self.repo / ".claude/settings.json").read_text(encoding="utf-8"))
+        post_matcher = claude_cfg["hooks"]["PostToolUse"][0]["matcher"]
+        self.assertIn("Agent", post_matcher)
+        self.assertIn("Task", post_matcher)
+
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src/svc.py").write_text("v = 1\n", encoding="utf-8")
+
+        # Mark dirty via Write, mark reviewed via Claude `Agent` tool (Gap #8)
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "src/svc.py"}, "cwd": str(self.repo)})
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_input": {"subagent_type": "verigate-reviewer"}, "cwd": str(self.repo)})
+
+        # `echo pytest` must NOT mark verified
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "echo pytest"}, "tool_response": {"exit_code": 0}, "cwd": str(self.repo)})
+        # Calling verifier subagent via Agent or Task must NOT mark verified
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_input": {"subagent_type": "verigate-verifier"}, "cwd": str(self.repo)})
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Task", "tool_input": {"subagent_type": "verigate-verifier"}, "cwd": str(self.repo)})
+        # Real test command with non-zero exit_code must NOT mark verified
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "pytest -q"}, "tool_response": {"exit_code": 1}, "cwd": str(self.repo)})
+
+        # Stop must still block (not verified!)
+        s_block = self._hook({"session_id": "gap3", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_block["decision"], "block")
+
+        # Real test command with exit_code == 0 DOES mark verified -> Stop allows (since Agent reviewer already set reviewed=True!)
+        self._hook({"session_id": "gap3", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "pytest -q"}, "tool_response": {"exit_code": 0}, "cwd": str(self.repo)})
+        s_allow = self._hook({"session_id": "gap3", "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+        self.assertEqual(s_allow, {})
+
+    def test_gap6_stronger_intent_and_spec_content_validation(self) -> None:
+        # Thin 80-char intent.md with only AC-1 must be REJECTED
+        thin_intent = "# Intent\nScope: Build billing endpoint.\n- AC-1: Return HTTP 200 on valid call.\n"
+        self.assertLess(len(thin_intent.strip()), 100)
+        (self.repo / ".sdlc/intent.md").write_text(thin_intent, encoding="utf-8")
+        (self.repo / ".sdlc/spec.md").write_text(VALID_SPEC_MD, encoding="utf-8")
+
+        p_rej = subprocess.run(
+            [sys.executable, str(self.aisdlc_bin), "approve", "--project", str(self.repo), "--stage", "S1_S2"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_rej.returncode, 0)
+        self.assertIn("200", p_rej.stdout)
+
+        # Full >=200-char intent.md with Scope, Constraints, AC-1, AC-2 passes
+        (self.repo / ".sdlc/intent.md").write_text(VALID_INTENT_MD, encoding="utf-8")
+        p_ok = subprocess.run(
+            [sys.executable, str(self.aisdlc_bin), "approve", "--project", str(self.repo), "--stage", "S1_S2"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(p_ok.returncode, 0, p_ok.stdout + p_ok.stderr)
+        self.assertEqual(json.loads(p_ok.stdout)["status"], "approved")
+
+    def test_gap7_per_change_isolation(self) -> None:
+        # Initialize two independent changes: PROJ-123 and PROJ-456
+        subprocess.run([sys.executable, str(self.aisdlc_bin), "init", "--project", str(self.repo), "--change", "PROJ-123"], check=True, capture_output=True, env=self.env)
+        c123 = self.repo / ".sdlc/changes/PROJ-123"
+        c456 = self.repo / ".sdlc/changes/PROJ-456"
+        c456.mkdir(parents=True, exist_ok=True)
+
+        (c123 / "intent.md").write_text(VALID_INTENT_MD, encoding="utf-8")
+        (c123 / "spec.md").write_text(VALID_SPEC_MD, encoding="utf-8")
+        (c123 / "review-findings.json").write_text(json.dumps({"verdict": "APPROVE", "quality_score": 95, "findings": []}), encoding="utf-8")
+
+        # PROJ-456 has unapproved intent/spec and blocking findings
+        (c456 / "intent.md").write_text(VALID_INTENT_MD + "\nExtra note for PROJ-456.\n", encoding="utf-8")
+        (c456 / "spec.md").write_text(VALID_SPEC_MD + "\nExtra note for PROJ-456.\n", encoding="utf-8")
+        (c456 / "review-findings.json").write_text(
+            json.dumps({"verdict": "CHANGES_REQUESTED", "quality_score": 60, "findings": [{"id": "REV-1", "severity": "High", "status": "open"}]}),
+            encoding="utf-8",
+        )
+
+        # Approve only PROJ-123
+        p_app = subprocess.run([sys.executable, str(self.aisdlc_bin), "approve", "--project", str(self.repo), "--change", "PROJ-123", "--stage", "S1_S2"], check=True, capture_output=True, text=True, env=self.env)
+        self.assertEqual(json.loads(p_app.stdout)["change_id"], "PROJ-123")
+        self.assertTrue((c123 / "approvals.json").is_file())
+        self.assertFalse((c456 / "approvals.json").exists())
+
+        # PROJ-123 passes validate & merge-check; PROJ-456 fails both without colliding
+        p_val123 = subprocess.run([sys.executable, str(self.aisdlc_bin), "validate", "--project", str(self.repo), "--change", "PROJ-123"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p_val123.returncode, 0, p_val123.stdout)
+        p_mc123 = subprocess.run([sys.executable, str(self.aisdlc_bin), "merge-check", "--project", str(self.repo), "--change", "PROJ-123"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(p_mc123.returncode, 0, p_mc123.stdout)
+        self.assertEqual(json.loads(p_mc123.stdout)["status"], "READY_TO_MERGE")
+
+        p_val456 = subprocess.run([sys.executable, str(self.aisdlc_bin), "validate", "--project", str(self.repo), "--change", "PROJ-456"], capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(p_val456.returncode, 0)
+        p_mc456 = subprocess.run([sys.executable, str(self.aisdlc_bin), "merge-check", "--project", str(self.repo), "--change", "PROJ-456"], capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(p_mc456.returncode, 0)
+        self.assertEqual(json.loads(p_mc456.stdout)["status"], "BLOCKED_BY_POLICY")
+
+    def test_gap9_dry_run_backups_and_fail_closed_json(self) -> None:
+        # 1. --dry-run writes zero files
+        dry_repo = self.tmp_dir / "dry-repo"
+        dry_repo.mkdir()
+        p_dry = subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(dry_repo), "--targets", "all", "--dry-run"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        dry_out = json.loads(p_dry.stdout)
+        self.assertTrue(dry_out["dry_run"])
+        self.assertGreater(len(dry_out["created"]), 0)
+        self.assertEqual(list(dry_repo.iterdir()), [], "--dry-run must write zero files")
+
+        # 2. Re-install creates .sdlc/backups/
+        p_re = subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(self.repo), "--targets", "claude"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        re_out = json.loads(p_re.stdout)
+        self.assertGreater(len(re_out["backed_up"]), 0)
+        backups_root = self.repo / ".sdlc/backups"
+        self.assertTrue(backups_root.is_dir())
+        self.assertGreater(len(list(backups_root.iterdir())), 0)
+
+        # 3. Malformed .claude/settings.json fails non-zero without overwriting
+        bad_json = "{not valid json"
+        settings_path = self.repo / ".claude/settings.json"
+        settings_path.write_text(bad_json, encoding="utf-8")
+        p_bad = subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(self.repo), "--targets", "claude"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_bad.returncode, 0)
+        self.assertEqual(settings_path.read_text(encoding="utf-8"), bad_json)
+
+    def test_gap10_terraform_iac_runners_mark_verified(self) -> None:
+        (self.repo / "infra").mkdir(exist_ok=True)
+        (self.repo / "infra/main.tf").write_text('resource "null_resource" "a" {}\n', encoding="utf-8")
+
+        for idx, tf_cmd in enumerate(("terraform validate", "terraform fmt -check", "tflint")):
+            sid = f"gap10-{idx}"
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "infra/main.tf"}, "cwd": str(self.repo)})
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": ".sdlc/review-findings.json"}, "cwd": str(self.repo)})
+
+            # Non-zero exit code must NOT verify
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": tf_cmd}, "tool_response": {"exit_code": 1}, "cwd": str(self.repo)})
+            s_blk = self._hook({"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+            self.assertEqual(s_blk["decision"], "block", f"Expected Stop block when {tf_cmd} exited 1")
+
+            # Zero exit code MUST verify
+            self._hook({"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": tf_cmd}, "tool_response": {"exit_code": 0}, "cwd": str(self.repo)})
+            s_ok = self._hook({"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.repo)})
+            self.assertEqual(s_ok, {}, f"Expected Stop allow when {tf_cmd} exited 0")
+
+    def test_gap11_and_gap12_azure_pipelines_and_no_sh_c_hooks(self) -> None:
+        # Gap #11: azure-pipelines.yml generated by --targets ci
+        ci_repo = self.tmp_dir / "ci-repo"
+        ci_repo.mkdir()
+        subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(ci_repo), "--targets", "ci"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        self.assertTrue((ci_repo / "azure-pipelines.yml").is_file())
+        self.assertTrue((ci_repo / ".github/workflows/verigate-gate.yml").is_file())
+        azdo_text = (ci_repo / "azure-pipelines.yml").read_text(encoding="utf-8")
+        self.assertIn("verigate.py validate", azdo_text)
+        self.assertIn("verigate.py merge-check", azdo_text)
+
+        # Gap #12: Generated .claude/settings.json and .agents/hooks.json do NOT wrap commands in `sh -c`
+        claude_raw = (self.repo / ".claude/settings.json").read_text(encoding="utf-8")
+        ag_raw = (self.repo / ".agents/hooks.json").read_text(encoding="utf-8")
+        self.assertNotIn("sh -c", claude_raw)
+        self.assertNotIn("sh -c", ag_raw)
+        self.assertIn("verigate.py hook", claude_raw)
+        self.assertIn("verigate.py hook", ag_raw)
+
+    def test_gaps4_and_5_readme_honest_control_framing(self) -> None:
+        readme = (KIT_ROOT / "README.md").read_text(encoding="utf-8")
+        lower = readme.lower()
+        self.assertIn("local agent guide rails", lower)
+        self.assertIn("hard enterprise controls", lower)
+        self.assertIn("branch protection", lower)
+        self.assertIn("human pr approval", lower)
+        self.assertIn("azure-pipelines.yml", readme)
+        self.assertIn("verigate-gate.yml", readme)
 
 
 if __name__ == "__main__":
