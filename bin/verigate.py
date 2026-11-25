@@ -281,34 +281,83 @@ DEFAULT_BRANCH_PATTERN = r"([A-Z][A-Z0-9]{1,10}-\d+)"
 TREE_SKIP_DIRS = {".git", ".sdlc", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
 
-def load_config(project_root: str) -> dict:
-    """Load declarative per-repo config from `.sdlc/config.json` with repo-root `verigate.json` override."""
+def _read_git_ref_json(abs_root: str, git_ref: str, rel_path: str) -> dict | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", abs_root, "show", f"{git_ref}:{rel_path}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        loaded = json.loads(proc.stdout)
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_verify_items(verify_cmds: object) -> list[str | list[str]]:
+    if isinstance(verify_cmds, str):
+        return [verify_cmds] if verify_cmds.strip() else []
+    if not isinstance(verify_cmds, list):
+        return []
+    out: list[str | list[str]] = []
+    for c in verify_cmds:
+        if isinstance(c, list):
+            toks = [str(t) for t in c if str(t)]
+            if toks:
+                out.append(toks)
+        elif str(c).strip():
+            out.append(str(c).strip())
+    return out
+
+
+def load_config(project_root: str, git_ref: str | None = None) -> dict:
+    """Load declarative per-repo config from `.sdlc/config.json` with repo-root `verigate.json` override.
+
+    When `git_ref` is provided (e.g. target branch `origin/main` in `ci-check`), config is loaded from
+    `git_ref` first so an untrusted PR branch cannot weaken its own `gated_paths` or `verify` commands.
+    Falls back to the working tree only when neither config file exists on `git_ref`.
+    """
     abs_root = os.path.realpath(project_root)
     raw: dict = {}
-    for cfg_path in (
-        os.path.join(abs_root, ".sdlc", "config.json"),
-        os.path.join(abs_root, "verigate.json"),
-    ):
-        if os.path.isfile(cfg_path):
-            try:
-                loaded = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    raw.update(loaded)
-            except Exception:
-                pass
+    config_source = "working_tree"
+
+    if git_ref:
+        ref_raw: dict = {}
+        for rel_cfg in (".sdlc/config.json", "verigate.json"):
+            loaded = _read_git_ref_json(abs_root, git_ref, rel_cfg)
+            if loaded:
+                ref_raw.update(loaded)
+        if ref_raw:
+            raw = ref_raw
+            config_source = f"base_ref:{git_ref}"
+        else:
+            config_source = "working_tree_fallback"
+
+    if not raw:
+        for cfg_path in (
+            os.path.join(abs_root, ".sdlc", "config.json"),
+            os.path.join(abs_root, "verigate.json"),
+        ):
+            if os.path.isfile(cfg_path):
+                try:
+                    loaded = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        raw.update(loaded)
+                except Exception:
+                    pass
 
     gated_paths_raw = raw.get("gated_paths")
     gated_paths: list[dict] = []
     if isinstance(gated_paths_raw, list):
         for item in gated_paths_raw:
             if isinstance(item, dict) and item.get("pattern"):
-                verify_cmds = item.get("verify") or []
-                if isinstance(verify_cmds, str):
-                    verify_cmds = [verify_cmds]
                 gated_paths.append(
                     {
                         "pattern": str(item["pattern"]),
-                        "verify": [str(c) for c in verify_cmds if str(c).strip()],
+                        "verify": _normalize_verify_items(item.get("verify")),
                         "cwd": str(item.get("cwd") or "."),
                     }
                 )
@@ -346,7 +395,8 @@ def load_config(project_root: str) -> dict:
     }
 
     return {
-        "version": str(raw.get("version") or "3.0.0"),
+        "version": str(raw.get("version") or "3.1.0"),
+        "config_source": config_source,
         "require_spec_approval": require_spec,
         "require_change_folder_for_gated_paths": require_change_folder,
         "fail_on_missing_tool": fail_on_missing_tool,
@@ -499,6 +549,21 @@ def compute_tree_digest(project_root: str, config: dict, target_files: list[str]
     return h.hexdigest()
 
 
+def _split_verify_command(cmd: str | list[str]) -> tuple[list[str], str]:
+    """Parse a verify command (list form or string form) preserving Windows backslashes."""
+    if isinstance(cmd, list):
+        argv = [str(tok) for tok in cmd if str(tok)]
+        return argv, " ".join(argv)
+    cmd_str = str(cmd).strip()
+    if not cmd_str:
+        return [], ""
+    use_posix = (os.name != "nt") and not re.search(r"[A-Za-z]:\\", cmd_str)
+    tokens = shlex.split(cmd_str, posix=use_posix)
+    if not use_posix:
+        tokens = [_strip_quotes(t) for t in tokens]
+    return tokens, cmd_str
+
+
 def run_verify_rules(project_root: str, rules: list[dict], fail_on_missing_tool: bool) -> tuple[bool, list[dict]]:
     """Execute configured verify commands directly with shell=False and real OS exit codes."""
     abs_root = os.path.realpath(project_root)
@@ -511,16 +576,13 @@ def run_verify_rules(project_root: str, rules: list[dict], fail_on_missing_tool:
         if isinstance(cmds, str):
             cmds = [cmds]
         for cmd in cmds:
-            cmd_str = str(cmd).strip()
-            if not cmd_str:
-                continue
             try:
-                argv = shlex.split(cmd_str)
+                argv, cmd_str = _split_verify_command(cmd)
             except ValueError as exc:
                 results.append(
                     {
                         "pattern": pattern,
-                        "command": cmd_str,
+                        "command": str(cmd),
                         "cwd": cwd_rel,
                         "exit_code": 2,
                         "missing_tool": False,
@@ -1032,6 +1094,11 @@ def _segment_is_test_runner(seg: str) -> bool:
 
     prog = _normalize_prog_name(toks[0])
     args = [a.lower() for a in toks[1:]]
+    raw_args = toks[1:]
+
+    # Help, version, and dry-collection flags never execute real tests
+    if any(a in ("-h", "--help", "--version", "--collect-only", "--co") for a in args) or "-V" in raw_args:
+        return False
 
     if PYTHON_PROGS_RE.match(prog):
         i = 0
@@ -1511,6 +1578,7 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
             json.dumps(
                 {
                     "require_zero_findings": True,
+                    "require_review_in_ci": True,
                     "max_open_critical": 0,
                     "max_open_high": 0,
                     "min_quality_score": 85,
@@ -1544,28 +1612,43 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
     return 0
 
 
-def _evaluate_merge_policy(
-    project_root: str,
-    change_id: str | None = None,
-    prefer_git_head: bool = False,
-) -> tuple[bool, dict]:
-    """Evaluate review policy and spec SHA-256 digest consistency without side-effect printing."""
-    sdlc = Path(project_root) / ".sdlc"
-    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=bool(change_id))
-    art_dir = Path(art_dir_str)
-    policy_file = sdlc / "policy.json"
+def load_policy(project_root: str, git_ref: str | None = None) -> dict:
+    """Load `.sdlc/policy.json`, preferring `git_ref` when provided so PRs cannot weaken merge policy."""
+    abs_root = os.path.realpath(project_root)
     policy = {
         "require_zero_findings": True,
+        "require_review_in_ci": True,
         "max_open_critical": 0,
         "max_open_high": 0,
         "min_quality_score": 85,
         "max_review_fix_cycles": 3,
     }
+    if git_ref:
+        ref_pol = _read_git_ref_json(abs_root, git_ref, ".sdlc/policy.json")
+        if ref_pol:
+            policy.update(ref_pol)
+            return policy
+    policy_file = Path(abs_root) / ".sdlc" / "policy.json"
     if policy_file.is_file():
         try:
-            policy.update(json.loads(policy_file.read_text(encoding="utf-8")))
+            loaded = json.loads(policy_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                policy.update(loaded)
         except Exception:
             pass
+    return policy
+
+
+def _evaluate_merge_policy(
+    project_root: str,
+    change_id: str | None = None,
+    prefer_git_head: bool = False,
+    git_ref: str | None = None,
+) -> tuple[bool, dict]:
+    """Evaluate review policy and spec SHA-256 digest consistency without side-effect printing."""
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(project_root, change_id, strict=bool(change_id))
+    art_dir = Path(art_dir_str)
+    policy = load_policy(project_root, git_ref=git_ref)
 
     reasons: list[str] = []
 
@@ -1734,9 +1817,10 @@ def _infer_change_id_from_paths(rel_paths: list[str]) -> str | None:
 
 
 def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: str | None = None) -> int:
-    """PR pipeline recompute gate: never trusts laptop verify-result.json; recomputes all checks from scratch."""
+    """PR pipeline recompute gate: loads config/policy from base_ref and recomputes all checks from scratch."""
     abs_root = os.path.realpath(project_root)
-    config = load_config(abs_root)
+    config = load_config(abs_root, git_ref=base_ref)
+    policy = load_policy(abs_root, git_ref=base_ref)
     touched_files = _git_diff_pr_files(abs_root, base_ref)
     gated_touched = [p for p in touched_files if is_path_gated(p, config)]
     head_commit = _git_head_commit(abs_root)
@@ -1752,6 +1836,7 @@ def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: st
             "status": "PASSED",
             "passed": True,
             "base_ref": base_ref,
+            "config_source": config.get("config_source"),
             "head_commit": head_commit,
             "artifact_dir": rel_dir,
             "change_id": cid,
@@ -1808,11 +1893,13 @@ def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: st
                         f"VERIFY_FAILED ({r['pattern']}): `{r['command']}` exited with code {r['exit_code']}."
                     )
 
-    # 4. Optional Stage 5 review policy consistency check when review-findings.json exists
-    if (art_dir / "review-findings.json").is_file():
-        m_ready, m_out = _evaluate_merge_policy(abs_root, change_id=cid, prefer_git_head=True)
+    # 4. Stage 5 review policy consistency check (required by default in CI unless require_review_in_ci is False)
+    require_review = bool(policy.get("require_review_in_ci", True))
+    if require_review or (art_dir / "review-findings.json").is_file():
+        m_ready, m_out = _evaluate_merge_policy(abs_root, change_id=cid, prefer_git_head=True, git_ref=base_ref)
         checks["merge_policy"] = {
             "passed": m_ready,
+            "required": require_review,
             "status": m_out["status"],
             "verdict": m_out["verdict"],
             "quality_score": m_out["quality_score"],
@@ -1828,6 +1915,7 @@ def cmd_ci_check(project_root: str, base_ref: str = "origin/main", change_id: st
         "status": "PASSED" if passed else "FAILED",
         "passed": passed,
         "base_ref": base_ref,
+        "config_source": config.get("config_source"),
         "head_commit": head_commit,
         "artifact_dir": rel_dir,
         "change_id": cid,
@@ -2045,16 +2133,45 @@ def _has_valid_waiver(
 
 
 def _git_pre_push_files(proj: str) -> list[str]:
-    for args in (
-        ["git", "-C", proj, "diff", "--name-only", "@{u}..HEAD"],
-        ["git", "-C", proj, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-    ):
+    # 1. Tracked upstream branch diff (when upstream exists)
+    try:
+        proc = subprocess.run(["git", "-C", proj, "diff", "--name-only", "@{u}..HEAD"], capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0:
+            return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
+
+    # 2. New branch with no upstream yet: diff from merge-base against default branch so ALL branch commits are checked
+    for base_candidate in ("origin/main", "origin/master", "main", "master"):
         try:
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
-            if proc.returncode == 0:
-                return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+            mb = subprocess.run(
+                ["git", "-C", proj, "merge-base", "HEAD", base_candidate],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if mb.returncode == 0 and mb.stdout.strip():
+                base_sha = mb.stdout.strip()
+                head_sha = _git_head_commit(proj)
+                if base_sha != head_sha:
+                    proc = subprocess.run(
+                        ["git", "-C", proj, "diff", "--name-only", f"{base_sha}..HEAD"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if proc.returncode == 0:
+                        return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
         except Exception:
             continue
+
+    # 3. Root-commit / single-branch fallback
+    try:
+        proc = subprocess.run(["git", "-C", proj, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0:
+            return [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
     return []
 
 

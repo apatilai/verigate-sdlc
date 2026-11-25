@@ -6,3 +6,7 @@ __pycache__/
 !.env.example
 .sdlc/audit.jsonl
 .sdlc/waivers.jsonl
+.sdlc/verify-result.json
+.sdlc/changes/*/verify-result.json
+.sdlc/changes/*/waivers.jsonl
+.sdlc/backups/

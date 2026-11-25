@@ -23,7 +23,7 @@ KIT_ROOT = Path(__file__).resolve().parent
 MARKER_START = "<!-- VERIGATE:START -->"
 MARKER_END = "<!-- VERIGATE:END -->"
 AZDO_VERIGATE_MARKER = "# VeriGate AI-SDLC Policy Gate"
-DEFAULT_VERIGATE_REF = "v3.0.0"
+DEFAULT_VERIGATE_REF = "v3.1.0"
 DEFAULT_VERIGATE_REPO = "https://github.com/apatilai/verigate-sdlc.git"
 
 CLAUDE_PRE_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell"
@@ -159,17 +159,20 @@ def _render_azure_pipelines_ci(
 ) -> str:
     ref = _clean_ci_param(verigate_ref, "verigate_ref")
     repo = _clean_ci_param(verigate_repo, "verigate_repo")
-    return f"""{AZDO_VERIGATE_MARKER} (Azure Pipelines - Pinned Release v3.0)
+    return f"""{AZDO_VERIGATE_MARKER} (Azure Pipelines - Pinned Release v3.1)
 # Security: Checks out a pinned VeriGate release into $(Agent.TempDirectory)/verigate instead of
 # running any checker script from the untrusted PR branch.
-# `verigate ci-check` recomputes all configured verification commands from scratch (never
-# trusting laptop verify-result.json), enforces required change folders for touched gated
-# paths, and fails closed if a required tool is missing.
-# Enforce human approval via Azure DevOps branch policies + required CODEOWNERS reviewer on `.sdlc/changes/**`.
+# `verigate ci-check` loads config/policy from the target branch, recomputes all configured
+# verification commands from scratch (never trusting laptop verify-result.json), requires a
+# change folder and review report for touched gated paths, and fails closed on missing tools.
+#
+# Azure Repos Governance Setup (Azure Repos does not use GitHub CODEOWNERS):
+#   1. PR Trigger: Enable this pipeline under Branch Policies -> Build Validation on your target branch.
+#   2. Human Sign-off: Add required reviewers under Branch Policies -> Automatically included reviewers
+#      with path filter `/.sdlc/changes/*`.
 trigger:
   - main
-pr:
-  - main
+pr: none
 
 variables:
   VERIGATE_REPO: {_yaml_sq(repo)}
@@ -375,6 +378,33 @@ def _resolve_azdo_pipeline_path(target_dir: Path) -> Path:
     return root_azdo
 
 
+def _upsert_gitignore(tx: _InstallTx, target_dir: Path) -> None:
+    gi_path = target_dir / ".gitignore"
+    start = "# VERIGATE:START"
+    end = "# VERIGATE:END"
+    entries = (
+        f"{start}\n"
+        ".sdlc/verify-result.json\n"
+        ".sdlc/changes/*/verify-result.json\n"
+        ".sdlc/audit.jsonl\n"
+        ".sdlc/waivers.jsonl\n"
+        ".sdlc/changes/*/waivers.jsonl\n"
+        ".sdlc/backups/\n"
+        f"{end}\n"
+    )
+    if not gi_path.exists():
+        tx.write_text(gi_path, entries)
+        return
+    existing = gi_path.read_text(encoding="utf-8")
+    pat = re.compile(re.escape(start) + r".*?" + re.escape(end) + r"\n?", re.DOTALL)
+    if pat.search(existing):
+        updated = pat.sub(entries, existing, count=1)
+    else:
+        sep = "\n\n" if existing and not existing.endswith("\n\n") else ("\n" if existing and not existing.endswith("\n") else "")
+        updated = existing + sep + entries
+    tx.write_text(gi_path, updated)
+
+
 def _git_hook_script(adapter: str) -> str:
     return (
         "#!/usr/bin/env sh\n"
@@ -548,6 +578,10 @@ def install(
 
         if not dry_run and activate_git_hooks and (target_dir / ".git").exists():
             subprocess.run(["git", "-C", str(target_dir), "config", "core.hooksPath", ".githooks"], check=False)
+
+    # Keep commit-bound local verify-result.json & logs git-ignored so committing never stales verify proof
+    _upsert_gitignore(tx, target_dir)
+    installed.append(".gitignore")
 
     result: dict = {
         "target": str(target_dir),

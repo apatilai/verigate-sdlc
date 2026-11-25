@@ -1,7 +1,14 @@
 {
-  "detected_provider": "github",
+  "version": "3.1.0",
   "verdict": "APPROVE",
-  "quality_score": 99,
-  "summary": "VeriGate AI-SDLC v2.6 reviewed and verified: all 4 live Windows Claude Code trial findings fixed (standalone final-segment test verification + stdout/stderr failure banners, sanctioned issue_bridge.py gate, read-only .sdlc inspection allowlist, non-crash Stop wording). 21/21 unit tests passing.",
+  "score": 100,
+  "reviewed_at": "2026-11-26T07:43:00Z",
+  "summary": "VeriGate AI-SDLC v3.1.0 fixes the Windows shlex.split backslash stripping bug (plus list-form verify commands), blocks pytest --help/--version/--collect-only false positives, loads ci-check config and policy from the target base branch (--base), enforces require_review_in_ci=true by default, upserts verify-result.json into .gitignore via install_verigate.py, checks merge-base..HEAD in git-pre-push for new branches without upstream, and fixes Azure Pipelines Build Validation & Automatically Included Reviewers guidance. All 28 unit tests pass.",
+  "counts": {
+    "Critical": 0,
+    "High": 0,
+    "Medium": 0,
+    "Low": 0
+  },
   "findings": []
 }

@@ -1240,11 +1240,34 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertTrue(d_fail["checks"]["verify"]["recomputed"])
         self.assertFalse(d_fail["checks"]["verify"]["passed"])
 
-        # Fix the actual code so the test passes -> ci-check PASSES!
+        # Fix the actual code so the test passes, but omit review-findings.json -> ci-check STILL FAILS (require_review_in_ci=true)!
         (repo / "services/api.py").write_text("def compute():\n    return 42\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "add", "services/api.py"], check=True)
         subprocess.run(
             ["git", "-C", str(repo), "commit", "-m", "fix: return 42"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        p_ci_no_rev = subprocess.run(
+            [sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "main"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertNotEqual(p_ci_no_rev.returncode, 0)
+        d_no_rev = json.loads(p_ci_no_rev.stdout)
+        self.assertTrue(d_no_rev["checks"]["verify"]["passed"])
+        self.assertFalse(d_no_rev["checks"]["merge_policy"]["passed"])
+
+        # Add passing review-findings.json -> ci-check PASSES!
+        (cdir / "review-findings.json").write_text(
+            json.dumps({"verdict": "APPROVE", "quality_score": 96, "findings": []}, indent=2),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", str(cdir / "review-findings.json")], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "chore: add review-findings.json"],
             check=True,
             capture_output=True,
             env=self.env,
@@ -1262,6 +1285,7 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         self.assertTrue(d_ok["checks"]["verify"]["recomputed"])
         self.assertTrue(d_ok["checks"]["verify"]["passed"])
         self.assertTrue(d_ok["checks"]["change_folder"]["passed"])
+        self.assertTrue(d_ok["checks"]["merge_policy"]["passed"])
 
     def test_v30_pinned_release_ci_templates_and_pre_push_install(self) -> None:
         pin_repo = self.tmp_dir / "v3-pinned-install"
@@ -1334,6 +1358,86 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
             "[VeriGate Guide Rail — Not a crash]",
         ):
             self.assertIn(token, readme, f"README.md missing v3.0 pillar token: {token}")
+
+    def test_v31_windows_split_base_config_review_gitignore_and_merge_base(self) -> None:
+        vmod = _load_module("verigate_v31", KIT_ROOT / "bin/verigate.py")
+
+        # 1. Windows backslash paths preserved in string form + list form supported
+        argv1, _ = vmod._split_verify_command(r"C:\Python314\python.exe -m unittest discover -s tests")
+        self.assertEqual(argv1[0], r"C:\Python314\python.exe")
+        argv2, _ = vmod._split_verify_command(r'"C:\Program Files\Python314\python.exe" -m unittest')
+        self.assertEqual(argv2[0], r"C:\Program Files\Python314\python.exe")
+        argv3, _ = vmod._split_verify_command([sys.executable, "-c", "import sys; sys.exit(0)"])
+        self.assertEqual(argv3[0], sys.executable)
+
+        # 2. pytest --help / --version / --collect-only rejected as real test runs
+        for help_cmd in ("pytest --help", "pytest -h", "pytest --version", "pytest -V", "pytest --collect-only", "terraform validate -h"):
+            self.assertFalse(vmod.is_real_test_runner_command(help_cmd), f"Should reject: {help_cmd}")
+
+        # 3. ci-check loads config from target branch (`main`), NOT untrusted PR branch!
+        repo = self.tmp_dir / "v31-base-config"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "ci@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "CI"], check=True)
+        subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(repo), "--targets", "git,ci", "--activate-git-hooks"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        vbin = repo / ".sdlc/bin/verigate.py"
+
+        # Verify .gitignore ignores verify-result.json and Azure Pipelines uses pr: none + Build Validation (no CODEOWNERS)
+        gi = (repo / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".sdlc/verify-result.json", gi)
+        self.assertIn(".sdlc/changes/*/verify-result.json", gi)
+        az_yml = (repo / "azure-pipelines.yml").read_text(encoding="utf-8")
+        self.assertIn("pr: none", az_yml)
+        self.assertIn("Build Validation", az_yml)
+        self.assertIn("Automatically included reviewers", az_yml)
+
+        # Commit strict verigate.json on `main` using list-form verify command
+        (repo / "verigate.json").write_text(
+            json.dumps(
+                {
+                    "version": "3.1.0",
+                    "require_change_folder_for_gated_paths": True,
+                    "fail_on_missing_tool": True,
+                    "gated_paths": [{"pattern": "services/**", "verify": [[sys.executable, "-c", "import sys; sys.exit(1)"]]}],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "chore: strict main config"], check=True, capture_output=True, env=self.env)
+
+        # PR branch tries to weaken verigate.json to gated_paths: [] AND commits across 2 commits (no upstream)
+        subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/PROJ-901-tamper"], check=True, capture_output=True)
+        (repo / "verigate.json").write_text(json.dumps({"gated_paths": []}, indent=2), encoding="utf-8")
+        (repo / "services").mkdir()
+        (repo / "services/svc.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "commit 1: gated file + weakened config"], check=True, capture_output=True, env=self.env)
+
+        # Commit 2 only touches non-gated docs/note.md -> _git_pre_push_files must STILL see services/svc.py via merge-base!
+        (repo / "docs").mkdir()
+        (repo / "docs/note.md").write_text("# note\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "docs/note.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "--no-verify", "-m", "commit 2: docs only"], check=True, capture_output=True, env=self.env)
+
+        pre_push_files = vmod._git_pre_push_files(str(repo))
+        self.assertIn("services/svc.py", pre_push_files)
+        self.assertIn("docs/note.md", pre_push_files)
+
+        # ci-check --base main MUST load verigate.json from `main` and FAIL (PR cannot disable its own gate!)
+        p_ci = subprocess.run([sys.executable, str(vbin), "ci-check", "--project", str(repo), "--base", "main"], capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(p_ci.returncode, 0)
+        d_ci = json.loads(p_ci.stdout)
+        self.assertEqual(d_ci["config_source"], "base_ref:main")
+        self.assertIn("services/svc.py", d_ci["gated_paths_touched"])
+        self.assertFalse(d_ci["passed"])
 
 
 if __name__ == "__main__":
