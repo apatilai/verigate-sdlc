@@ -1,15 +1,13 @@
-# Stage 5 Governed Code Review Report — VeriGate AI-SDLC v3.2.0
+# Stage 5 Governed Code Review Report — VeriGate AI-SDLC v3.2.1
 
 - **Verdict**: `APPROVE`
 - **Score**: `100 / 100`
-- **Test Verification**: `30 / 30` tests passing (`python3 -m unittest discover -s tests -v`)
+- **Test Verification**: `31 / 31` tests passing (`python3 -m unittest discover -s tests -v`)
 - **Open Findings**: `0` (Critical: 0, High: 0, Medium: 0, Low: 0)
 
-## v3.2.0 Live-Trial Fixes Verified
-1. **Claude `PreToolUse` neutral allow**: Returns `{}` instead of `permissionDecision: "allow"` so host permission prompts are never bypassed.
-2. **Review binding (`stamp-review` + `reviewed_tree_digest`)**: Rejects 1-line stub reviews and stale reviews after gated file edits.
-3. **Review policy enforced at `git-pre-push`**: Catches open findings or stale review digests before push.
-4. **Windows Python command in generated docs**: `install_verigate.py` renders `py_cmd` (`python` on Windows, `python3` on POSIX) into Markdown instructions and agent prompts.
-5. **Harmless combined commands allowed**: Read-only chained commands (`git status && ls .sdlc`) and `&&`-chained safe VeriGate commands (`cd repo && python .sdlc/bin/verigate.py verify --project .`) are allowed; `approve`/`waive`/`create` chaining stays denied.
-6. **Portable `{python}` + CI target split + ASCII `[BLOCKED]`**: `{python}`/`$PYTHON` expand to `sys.executable` in `verify`, `--targets ci` writes GitHub Actions only (`--targets azdo-ci` for Azure Pipelines), `stdin=subprocess.DEVNULL` prevents interactive hangs, config version bumped to `3.2.0`, and `[BLOCKED]` replaces `❌`.
-7. **Deliberate-break smoke test documented**: Added setup verification guide to `README.md`.
+## v3.2.1 Fixes Verified
+1. **Full Python path support in hooks**: `SANCTIONED_GATE_CMD_RE` and `SANCTIONED_BRIDGE_CMD_RE` accept full/quoted Windows and POSIX Python paths (e.g. `C:/Python314/python.exe`, `"C:\Program Files\Python314\python.exe"`, `/usr/bin/python3.12`).
+2. **Skill file Python rendering**: `_copy_rendered_skill_tree()` rewrites all 13 `python3 .sdlc/bin/` references across `skills/*/SKILL.md` to the configured `--python-cmd`.
+3. **Git `core.hooksPath` bypass blocked**: `GIT_NO_VERIFY_RE` now denies `git -c core.hooksPath=...`, `git --config-env=core.hooksPath=...`, `git config core.hooksPath ...`, and `git push --no-verify`.
+4. **Hardened read-only git & subshell checks**: `_is_readonly_git_segment()` rejects `git -c`, `git diff --output`/`-o`/`--ext-diff`, `git branch -D`/mutating flags, and mutating `tag`/`remote`; command substitution (`$(...)` / backticks) is checked in the raw command string (including inside double quotes).
+5. **Safe `;` and read-only pipe chains**: Allows `ls .sdlc; git status`, `cat .sdlc/config.json | head -n 5`, and `cd . ; <py> .sdlc/bin/verigate.py verify --project .` while keeping `approve`/`waive`/`create` strictly standalone.

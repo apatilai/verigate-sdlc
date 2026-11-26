@@ -1,9 +1,9 @@
 {
-  "version": "3.2.0",
+  "version": "3.2.1",
   "verdict": "APPROVE",
   "score": 100,
-  "reviewed_at": "2026-11-26T13:52:00Z",
-  "summary": "VeriGate AI-SDLC v3.2.0 resolves all 7 issues from the live Claude Code trial: Claude PreToolUse returns neutral {} instead of permissionDecision allow, review-findings.json requires substantive summary and reviewed_tree_digest (via stamp-review), git-pre-push enforces Stage 5 review policy when review-findings.json exists, install_verigate.py renders OS-specific python commands into docs and separates --targets ci from azdo-ci, {python} expands to sys.executable in verify commands, harmless chained read-only/VeriGate commands are allowed, stdin=DEVNULL prevents verify hangs, and ASCII [BLOCKED] replaces Unicode crosses on Windows.",
+  "reviewed_at": "2026-11-26T14:10:00Z",
+  "summary": "VeriGate AI-SDLC v3.2.1 fixes hook matching for full Python executable paths (e.g. C:/Python314/python.exe), rewrites all 13 python3 references in installed skill files, blocks git -c core.hooksPath bypasses, tightens read-only git checks (rejecting -c, diff --output, branch -D, quoted $(...)), and allows safe ; and read-only pipe chains.",
   "counts": {
     "Critical": 0,
     "High": 0,

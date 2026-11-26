@@ -65,11 +65,23 @@ GOVERNANCE_RE = re.compile(
     r"(^|/)(REVIEW\.md|verigate\.json|\.sdlc/(REVIEW\.md|config\.json|policy\.json|active-change)|\.claude/settings.*\.json|\.agents/hooks\.json|\.gemini/settings\.json|\.githooks/[^/]+|\.github/workflows/[^/]+\.ya?ml|azure-pipelines.*\.ya?ml)$",
     re.IGNORECASE,
 )
+_PYTHON_EXE_PAT = (
+    r'(?:"[^"]*?python(?:\d+(?:\.\d+)*)?(?:\.exe)?"'
+    r"|'[^']*?python(?:\d+(?:\.\d+)*)?(?:\.exe)?'"
+    r'|(?:[^\s"\']*(?:[/\\]))?python(?:\d+(?:\.\d+)*)?(?:\.exe)?'
+    r"|py(?:\.exe)?)"
+)
 SANCTIONED_GATE_CMD_RE = re.compile(
-    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check|verify|ci-check|stamp-review)\b(.*)$'
+    r'^\s*(?:PATH="[^"]*"\s+)?'
+    + _PYTHON_EXE_PAT
+    + r'\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check|verify|ci-check|stamp-review)\b(.*)$',
+    re.IGNORECASE,
 )
 SANCTIONED_BRIDGE_CMD_RE = re.compile(
-    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?issue_bridge\.py"|\'[^\']*?issue_bridge\.py\'|\S*?issue_bridge\.py)\s+(detect|preview|create)\b(.*)$'
+    r'^\s*(?:PATH="[^"]*"\s+)?'
+    + _PYTHON_EXE_PAT
+    + r'\s+(?:"[^"]*?issue_bridge\.py"|\'[^\']*?issue_bridge\.py\'|\S*?issue_bridge\.py)\s+(detect|preview|create)\b(.*)$',
+    re.IGNORECASE,
 )
 SHELL_CHAIN_OR_REDIRECT_RE = re.compile(r"[;&|`$><\n]")
 ANY_VERIGATE_INVOCATION_RE = re.compile(r"(^|[\s/\"'\\])verigate\.py\b", re.IGNORECASE)
@@ -89,7 +101,14 @@ READONLY_SHELL_PROGS = {
     "gci",
     "gc",
 }
-GIT_NO_VERIFY_RE = re.compile(r"\bgit\s+commit\b.*(?:\s--no-verify\b|\s-[a-zA-Z]*n\b)")
+GIT_NO_VERIFY_RE = re.compile(
+    r"\bgit\b(?:"
+    r".*\b(?:commit|push)\b.*(?:\s--no-verify\b|\s-[a-zA-Z]*n\b)"
+    r"|.*\s(?:-c|--config-env)(?:\s+|=)[\"']?core\.hooksPath\b"
+    r"|.*\bconfig\b.*\bcore\.hooksPath\b"
+    r")",
+    re.IGNORECASE,
+)
 SHELL_SECRET_WRITE_RE = re.compile(
     r"(?:>|>>|\btee\b|\bcp\b|\bmv\b|\bsed\s+-i|\bperl\s+-[a-zA-Z]*i|"
     r"\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Clear-Content|Copy-Item|Move-Item|Rename-Item|New-Item)\b)"
@@ -1228,6 +1247,43 @@ def _segment_is_test_runner(seg: str) -> bool:
 
 
 READONLY_GIT_SUBCMDS = {"status", "log", "diff", "branch", "rev-parse", "show", "ls-files", "tag", "remote", "describe"}
+READONLY_PIPE_FILTERS = {"head", "tail", "grep", "rg", "wc", "sort", "uniq", "select-object", "select-string", "measure-object"}
+_GIT_BRANCH_READONLY_FLAGS = {"-a", "--all", "-r", "--remotes", "-l", "--list", "-v", "-vv", "--verbose", "--show-current", "--contains", "--merged", "--no-merged"}
+
+
+def _is_readonly_git_segment(args: list[str]) -> bool:
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        flag = args[i]
+        # Reject `-c` / `--config-env` (can override alias, core.hooksPath, core.fsmonitor, diff.external, etc.)
+        if flag in ("-c", "--config-env") or flag.startswith("-c") or flag.startswith("--config-env="):
+            return False
+        if flag in ("-C", "--git-dir", "--work-tree") and i + 1 < len(args):
+            i += 2
+        else:
+            i += 1
+    if i >= len(args):
+        return False
+    sub = args[i].lower()
+    sub_args = args[i + 1 :]
+    if sub not in READONLY_GIT_SUBCMDS:
+        return False
+    if sub == "diff":
+        for a in sub_args:
+            if a in ("--output", "-o", "--ext-diff") or a.startswith("--output=") or a.startswith("-o"):
+                return False
+        return True
+    if sub == "branch":
+        # Allow read-only listing/inspection flags only; reject -d/-D/-m/-M/-c/-C or creating branches
+        for a in sub_args:
+            if a not in _GIT_BRANCH_READONLY_FLAGS:
+                return False
+        return True
+    if sub == "tag":
+        return not sub_args or all(a in ("-l", "--list", "-n") or a.startswith("--sort=") for a in sub_args)
+    if sub == "remote":
+        return not sub_args or sub_args[0] in ("-v", "--verbose", "show", "get-url")
+    return True
 
 
 def _is_readonly_segment(seg: str) -> bool:
@@ -1235,27 +1291,22 @@ def _is_readonly_segment(seg: str) -> bool:
     if not toks:
         return False
     prog = _normalize_prog_name(toks[0])
-    if prog in READONLY_SHELL_PROGS or prog in ("cd", "set-location", "pushd", "popd"):
+    if prog in READONLY_SHELL_PROGS or prog in READONLY_PIPE_FILTERS or prog in ("cd", "set-location", "pushd", "popd"):
         return True
     if prog == "git":
-        args = toks[1:]
-        i = 0
-        while i < len(args) and args[i].startswith("-"):
-            if args[i] in ("-C", "-c", "--git-dir", "--work-tree") and i + 1 < len(args):
-                i += 2
-            else:
-                i += 1
-        if i < len(args) and args[i].lower() in READONLY_GIT_SUBCMDS:
-            return True
+        return _is_readonly_git_segment(toks[1:])
     return False
 
 
 def _is_readonly_shell_command(cmd: str) -> bool:
-    """Return True if every segment is a pure read-only inspector (or `cd`/read-only `git`) with no redirections or subshells."""
+    """Return True if every segment is a pure read-only inspector (or `cd`/read-only `git`/read-only pipe filter) with no redirections or subshells."""
     if not cmd or not cmd.strip():
         return False
+    # Check command substitution in raw cmd (including inside double quotes!)
+    if re.search(r"`|\$\(", cmd):
+        return False
     unquoted = _strip_quoted_strings(cmd)
-    if re.search(r"[|<>`\n]|(?<!&)&(?!&)|\$\(", unquoted):
+    if re.search(r"[<>\n]|(?<!&)&(?!&)", unquoted):
         return False
     if re.search(r"(shadow_ledger\.json|verigate-shadow)", cmd, re.IGNORECASE):
         return False
@@ -1565,9 +1616,12 @@ SAFE_VERIGATE_SUBCMDS = ("status", "validate", "dispatch", "merge-check", "verif
 
 
 def _is_safe_chained_verigate_cmd(cmd: str) -> bool:
-    """Allow `&&`-chained safe commands with non-mutating VeriGate/bridge subcommands (never approve/waive/create)."""
+    """Allow `&&`/`;`/`|`-chained safe commands with non-mutating VeriGate/bridge subcommands (never approve/waive/create)."""
+    # Reject command substitution even inside double quotes (e.g. git commit -m "$(evil)")
+    if re.search(r"`|\$\(", cmd):
+        return False
     unquoted = _strip_quoted_strings(cmd)
-    if re.search(r"[;|<>`\n]|(?<!&)&(?!&)|\$\(", unquoted):
+    if re.search(r"[<>\n]|(?<!&)&(?!&)", unquoted):
         return False
     segs = _split_shell_segments(cmd)
     if len(segs) < 2:
@@ -1597,8 +1651,13 @@ def _is_safe_chained_verigate_cmd(cmd: str) -> bool:
             continue
         toks = [_strip_quotes(t) for t in _safe_split(s, posix=False)]
         prog = _normalize_prog_name(toks[0]) if toks else ""
-        if prog == "git" and len(toks) >= 2 and toks[1].lower() in ("add", "commit"):
-            continue
+        if prog == "git" and len(toks) >= 2 and not any(a in ("-c", "--config-env") or a.startswith("-c") or a.startswith("--config-env=") for a in toks[1:]):
+            # Find subcommand after safe git flags like -C
+            gi = 1
+            while gi < len(toks) and toks[gi].startswith("-"):
+                gi += 2 if toks[gi] in ("-C", "--git-dir", "--work-tree") and gi + 1 < len(toks) else 1
+            if gi < len(toks) and toks[gi].lower() in ("add", "commit"):
+                continue
         return False
     return saw_verigate
 
@@ -1687,7 +1746,7 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
         cfg.write_text(
             json.dumps(
                 {
-                    "version": "3.2.0",
+                    "version": "3.2.1",
                     "require_spec_approval": require_spec,
                     "require_change_folder_for_gated_paths": require_spec,
                     "fail_on_missing_tool": True,

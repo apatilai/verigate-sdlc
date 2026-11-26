@@ -691,7 +691,7 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         cfg = json.loads((self.repo / ".sdlc/config.json").read_text(encoding="utf-8"))
         self.assertIn("terraform_dirs", cfg)
         self.assertIsInstance(cfg["terraform_dirs"], list)
-        self.assertEqual(cfg.get("version"), "3.2.0")
+        self.assertEqual(cfg.get("version"), "3.2.1")
         self.assertIn("gated_paths", cfg)
         self.assertIn("fail_on_missing_tool", cfg)
 
@@ -1728,6 +1728,73 @@ class VeriGateSDLCTestSuite(unittest.TestCase):
         readme = (KIT_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("Deliberate-Break Smoke Test", readme)
         self.assertIn("pythonpath=src", readme)
+
+    def test_v321_full_python_path_skill_rendering_and_git_security_hardening(self) -> None:
+        vmod = _load_module("verigate_v321", KIT_ROOT / "bin/verigate.py")
+
+        # 1. Full Python paths accepted by hook for verigate.py & issue_bridge.py
+        for full_py_cmd in (
+            r"C:/Python314/python.exe .sdlc/bin/verigate.py verify --project .",
+            r'"C:\Program Files\Python314\python.exe" .sdlc/bin/verigate.py status --project .',
+            "/usr/bin/python3.12 .sdlc/bin/issue_bridge.py detect --repo .",
+            r"cd . ; C:/Python314/python.exe .sdlc/bin/verigate.py verify --project .",
+        ):
+            r = self._hook({"session_id": "s321", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": full_py_cmd}, "cwd": str(self.repo)})
+            self.assertEqual(r, {}, f"Expected neutral {{}} for full python path cmd: {full_py_cmd}")
+
+        r_app = self._hook(
+            {"session_id": "s321", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "C:/Python314/python.exe .sdlc/bin/verigate.py approve --project . --stage S1_S2"}, "cwd": str(self.repo)}
+        )
+        self.assertEqual(r_app["hookSpecificOutput"]["permissionDecision"], "ask")
+
+        # 2. Installed skill files rewrite all 13 python3 references to configured --python-cmd
+        win_repo = self.tmp_dir / "v321-win-skills"
+        win_repo.mkdir()
+        subprocess.run(
+            [sys.executable, str(KIT_ROOT / "install_verigate.py"), "--target", str(win_repo), "--targets", "claude", "--python-cmd", "C:/Python314/python.exe"],
+            check=True,
+            capture_output=True,
+            env=self.env,
+        )
+        skill_mds = list((win_repo / ".claude" / "skills").rglob("*.md"))
+        self.assertGreaterEqual(len(skill_mds), 3)
+        for smd in skill_mds:
+            txt = smd.read_text(encoding="utf-8")
+            self.assertNotIn("python3 .sdlc/bin/", txt, f"Unrewritten python3 in {smd}")
+            self.assertIn("C:/Python314/python.exe .sdlc/bin/", txt, f"Missing configured python in {smd}")
+
+        # 3. Git hooksPath bypasses are DENIED
+        for bypass_cmd in (
+            "git -c core.hooksPath=/dev/null commit -m 'skip'",
+            "git --config-env=core.hooksPath=EMPTY commit -m 'skip'",
+            "git config core.hooksPath /dev/null",
+            "git push --no-verify origin main",
+        ):
+            r = self._hook({"session_id": "s321", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": bypass_cmd}, "cwd": str(self.repo)})
+            self.assertEqual(r["hookSpecificOutput"]["permissionDecision"], "deny", f"Expected deny for: {bypass_cmd}")
+
+        # 4. Dangerous git flags & quoted $(...) are NOT treated as read-only or safe-chained
+        for unsafe_ro in (
+            "git diff --output=.sdlc/approvals.json",
+            "git branch -D main",
+            "git -c alias.x=!id x",
+            'git commit -m "$(id)"',
+        ):
+            self.assertFalse(vmod._is_readonly_shell_command(unsafe_ro), f"Must NOT be readonly: {unsafe_ro}")
+
+        r_subshell = self._hook(
+            {"session_id": "s321", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": 'git commit -m "$(id)" && python .sdlc/bin/verigate.py status --project .'}, "cwd": str(self.repo)}
+        )
+        self.assertEqual(r_subshell["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # 5. Harmless ; and read-only pipe chains are allowed ({})
+        for safe_ro in (
+            "ls .sdlc; git status",
+            "cat .sdlc/config.json | head -n 5",
+            "git branch --show-current && ls .sdlc",
+        ):
+            r = self._hook({"session_id": "s321", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": safe_ro}, "cwd": str(self.repo)})
+            self.assertEqual(r, {}, f"Expected neutral {{}} for safe readonly chain: {safe_ro}")
 
 
 if __name__ == "__main__":

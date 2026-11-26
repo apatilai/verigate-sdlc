@@ -23,7 +23,7 @@ KIT_ROOT = Path(__file__).resolve().parent
 MARKER_START = "<!-- VERIGATE:START -->"
 MARKER_END = "<!-- VERIGATE:END -->"
 AZDO_VERIGATE_MARKER = "# VeriGate AI-SDLC Policy Gate"
-DEFAULT_VERIGATE_REF = "v3.2.0"
+DEFAULT_VERIGATE_REF = "v3.2.1"
 DEFAULT_VERIGATE_REPO = "https://github.com/apatilai/verigate-sdlc.git"
 
 CLAUDE_PRE_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell"
@@ -106,6 +106,19 @@ def _render_python_docs(text: str, py_cmd: str) -> str:
         return text
     py_tok = f'"{py}"' if " " in py and not (py.startswith('"') and py.endswith('"')) else py
     return re.sub(r"\bpython3\s+(?=\.sdlc/bin/)", f"{py_tok} ", text)
+
+
+def _copy_rendered_skill_tree(tx: _InstallTx, src_dir: Path, dst_dir: Path, py_cmd: str) -> None:
+    for root, _, files in os.walk(src_dir):
+        rel_root = Path(root).relative_to(src_dir)
+        for fname in sorted(files):
+            src_file = Path(root) / fname
+            dst_file = dst_dir / rel_root / fname
+            if src_file.suffix.lower() == ".md":
+                rendered = _render_python_docs(src_file.read_text(encoding="utf-8"), py_cmd)
+                tx.write_text(dst_file, rendered)
+            else:
+                tx.copy_file(src_file, dst_file)
 
 
 def _render_universal_rule_body(py_cmd: str) -> str:
@@ -493,7 +506,7 @@ def install(
     if use_all or "codex" in targets:
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
-                tx.copy_tree(sk, target_dir / ".codex" / "skills" / sk.name)
+                _copy_rendered_skill_tree(tx, sk, target_dir / ".codex" / "skills" / sk.name, py_cmd)
         installed.append(".codex/skills/*")
 
     # 3. Claude Code (CLAUDE.md + .claude/settings.json + .claude/agents + .claude/skills)
@@ -505,7 +518,7 @@ def install(
             tx.write_text(claude_dir / "agents" / ag.name, rendered_ag)
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
-                tx.copy_tree(sk, claude_dir / "skills" / sk.name)
+                _copy_rendered_skill_tree(tx, sk, claude_dir / "skills" / sk.name, py_cmd)
         claude_script = '"$CLAUDE_PROJECT_DIR/.sdlc/bin/verigate.py"'
         claude_hooks = {
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _hook_cmd(claude_script, "claude", "UserPromptSubmit", py_cmd)}]}],
@@ -522,7 +535,7 @@ def install(
         ag_dir = target_dir / ".agents"
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
-                tx.copy_tree(sk, ag_dir / "skills" / sk.name)
+                _copy_rendered_skill_tree(tx, sk, ag_dir / "skills" / sk.name, py_cmd)
         ag_hooks = {
             "verigate-router": {
                 "PreInvocation": [{"type": "command", "command": _hook_cmd("../.sdlc/bin/verigate.py", "antigravity", "PreInvocation", py_cmd), "timeout": 5}]
