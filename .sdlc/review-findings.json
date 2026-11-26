@@ -1,9 +1,9 @@
 {
-  "version": "3.1.1",
+  "version": "3.2.0",
   "verdict": "APPROVE",
   "score": 100,
-  "reviewed_at": "2026-11-26T08:29:00Z",
-  "summary": "VeriGate AI-SDLC v3.1.1 fails closed in ci-check when --base cannot be resolved or when base-branch config/policy JSON is malformed (allowing working_tree_fallback only on first-adoption PRs where --base resolves with no config), removes `|| true` from CI `git fetch` commands, and rejects gated_paths rules with empty verify lists unless explicitly opted in with allow_empty_verify: true.",
+  "reviewed_at": "2026-11-26T13:52:00Z",
+  "summary": "VeriGate AI-SDLC v3.2.0 resolves all 7 issues from the live Claude Code trial: Claude PreToolUse returns neutral {} instead of permissionDecision allow, review-findings.json requires substantive summary and reviewed_tree_digest (via stamp-review), git-pre-push enforces Stage 5 review policy when review-findings.json exists, install_verigate.py renders OS-specific python commands into docs and separates --targets ci from azdo-ci, {python} expands to sys.executable in verify commands, harmless chained read-only/VeriGate commands are allowed, stdin=DEVNULL prevents verify hangs, and ASCII [BLOCKED] replaces Unicode crosses on Windows.",
   "counts": {
     "Critical": 0,
     "High": 0,

@@ -23,7 +23,7 @@ KIT_ROOT = Path(__file__).resolve().parent
 MARKER_START = "<!-- VERIGATE:START -->"
 MARKER_END = "<!-- VERIGATE:END -->"
 AZDO_VERIGATE_MARKER = "# VeriGate AI-SDLC Policy Gate"
-DEFAULT_VERIGATE_REF = "v3.1.1"
+DEFAULT_VERIGATE_REF = "v3.2.0"
 DEFAULT_VERIGATE_REPO = "https://github.com/apatilai/verigate-sdlc.git"
 
 CLAUDE_PRE_TOOL_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell"
@@ -98,6 +98,18 @@ This repository uses the **6-Stage VeriGate AI-Native Software Development Lifec
    - Whenever Stage 5 surfaces findings (`REV-001..REV-N`), present the **Executive Review Scorecard** and ask the user **both questions at the same time**:
      1. Raise issues in **GitHub Issues** (`gh`) or **Azure DevOps Work Items** (`az boards`) via `python3 .sdlc/bin/issue_bridge.py create ...`?
      2. Fix Critical/High or ALL findings right now and re-verify?"""
+
+
+def _render_python_docs(text: str, py_cmd: str) -> str:
+    py = (py_cmd or _default_python_cmd()).strip()
+    if py == "python3":
+        return text
+    py_tok = f'"{py}"' if " " in py and not (py.startswith('"') and py.endswith('"')) else py
+    return re.sub(r"\bpython3\s+(?=\.sdlc/bin/)", f"{py_tok} ", text)
+
+
+def _render_universal_rule_body(py_cmd: str) -> str:
+    return _render_python_docs(UNIVERSAL_RULE_BODY, py_cmd)
 
 
 def _render_github_actions_ci(
@@ -472,9 +484,11 @@ def install(
         )
     installed.extend([".sdlc/config.json", ".sdlc/policy.json", ".sdlc/REVIEW.md"])
 
+    rule_body = _render_universal_rule_body(py_cmd)
+
     # 2. Universal AGENTS.md & Codex skills
     if use_all or "universal" in targets or "codex" in targets:
-        _upsert_markdown_block(target_dir / "AGENTS.md", UNIVERSAL_RULE_BODY, tx=tx)
+        _upsert_markdown_block(target_dir / "AGENTS.md", rule_body, tx=tx)
         installed.append("AGENTS.md")
     if use_all or "codex" in targets:
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
@@ -484,10 +498,11 @@ def install(
 
     # 3. Claude Code (CLAUDE.md + .claude/settings.json + .claude/agents + .claude/skills)
     if use_all or "claude" in targets:
-        _upsert_markdown_block(target_dir / "CLAUDE.md", UNIVERSAL_RULE_BODY, tx=tx)
+        _upsert_markdown_block(target_dir / "CLAUDE.md", rule_body, tx=tx)
         claude_dir = target_dir / ".claude"
         for ag in sorted((KIT_ROOT / "agents").glob("*.md")):
-            tx.copy_file(ag, claude_dir / "agents" / ag.name)
+            rendered_ag = _render_python_docs(ag.read_text(encoding="utf-8"), py_cmd)
+            tx.write_text(claude_dir / "agents" / ag.name, rendered_ag)
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
                 tx.copy_tree(sk, claude_dir / "skills" / sk.name)
@@ -503,7 +518,7 @@ def install(
 
     # 4. Antigravity & Gemini CLI (GEMINI.md + .agents/hooks.json + .agents/skills)
     if use_all or "antigravity" in targets or "gemini" in targets:
-        _upsert_markdown_block(target_dir / "GEMINI.md", UNIVERSAL_RULE_BODY, tx=tx)
+        _upsert_markdown_block(target_dir / "GEMINI.md", rule_body, tx=tx)
         ag_dir = target_dir / ".agents"
         for sk in sorted((KIT_ROOT / "skills").iterdir()):
             if sk.is_dir():
@@ -530,30 +545,30 @@ def install(
         cur_dir = target_dir / ".cursor" / "rules"
         _upsert_markdown_block(
             cur_dir / "verigate.mdc",
-            UNIVERSAL_RULE_BODY,
-            frontmatter="---\ndescription: Enterprise 6-Stage AI-SDLC v3.0 (Git + Pinned PR Pipeline + Optional AI Hooks)\nalwaysApply: true\n---",
+            rule_body,
+            frontmatter="---\ndescription: Enterprise 6-Stage AI-SDLC v3.2 (Git + Pinned PR Pipeline + Optional AI Hooks)\nalwaysApply: true\n---",
             tx=tx,
         )
         installed.append(".cursor/rules/verigate.mdc")
 
     # 6. Windsurf (.windsurfrules)
     if use_all or "windsurf" in targets:
-        _upsert_markdown_block(target_dir / ".windsurfrules", UNIVERSAL_RULE_BODY, tx=tx)
+        _upsert_markdown_block(target_dir / ".windsurfrules", rule_body, tx=tx)
         installed.append(".windsurfrules")
 
     # 7. GitHub Copilot (.github/copilot-instructions.md)
     if use_all or "copilot" in targets:
         gh_dir = target_dir / ".github"
-        _upsert_markdown_block(gh_dir / "copilot-instructions.md", UNIVERSAL_RULE_BODY, tx=tx)
+        _upsert_markdown_block(gh_dir / "copilot-instructions.md", rule_body, tx=tx)
         installed.append(".github/copilot-instructions.md")
 
-    # 8. Pinned-Release CI Gates (GitHub Actions + Azure Pipelines)
-    if use_all or "ci" in targets:
+    # 8. Pinned-Release CI Gates (ci/github-ci -> GitHub Actions only; azdo-ci -> Azure Pipelines only; all -> both)
+    if use_all or "ci" in targets or "github-ci" in targets:
         gh_wf = target_dir / ".github" / "workflows" / "verigate-gate.yml"
         tx.write_text(gh_wf, _render_github_actions_ci(clean_ref, clean_repo))
         installed.append(".github/workflows/verigate-gate.yml")
 
-    if use_all or "ci" in targets or "azdo-ci" in targets:
+    if use_all or "azdo-ci" in targets:
         azdo_path = _resolve_azdo_pipeline_path(target_dir)
         tx.write_text(azdo_path, _render_azure_pipelines_ci(clean_ref, clean_repo))
         installed.append(azdo_path.relative_to(target_dir).as_posix())

@@ -66,7 +66,7 @@ GOVERNANCE_RE = re.compile(
     re.IGNORECASE,
 )
 SANCTIONED_GATE_CMD_RE = re.compile(
-    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check|verify|ci-check)\b(.*)$'
+    r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?verigate\.py"|\'[^\']*?verigate\.py\'|\S*?verigate\.py)\s+(status|validate|approve|waive|dispatch|merge-check|verify|ci-check|stamp-review)\b(.*)$'
 )
 SANCTIONED_BRIDGE_CMD_RE = re.compile(
     r'^\s*(?:PATH="[^"]*"\s+)?(?:python3?|py)\s+(?:"[^"]*?issue_bridge\.py"|\'[^\']*?issue_bridge\.py\'|\S*?issue_bridge\.py)\s+(detect|preview|create)\b(.*)$'
@@ -597,9 +597,9 @@ def compute_tree_digest(project_root: str, config: dict, target_files: list[str]
 
 
 def _split_verify_command(cmd: str | list[str]) -> tuple[list[str], str]:
-    """Parse a verify command (list form or string form) preserving Windows backslashes."""
+    """Parse a verify command (list form or string form) preserving Windows backslashes and `{python}` tokens."""
     if isinstance(cmd, list):
-        argv = [str(tok) for tok in cmd if str(tok)]
+        argv = [sys.executable if str(tok) in ("{python}", "$PYTHON") else str(tok) for tok in cmd if str(tok)]
         return argv, " ".join(argv)
     cmd_str = str(cmd).strip()
     if not cmd_str:
@@ -608,6 +608,7 @@ def _split_verify_command(cmd: str | list[str]) -> tuple[list[str], str]:
     tokens = shlex.split(cmd_str, posix=use_posix)
     if not use_posix:
         tokens = [_strip_quotes(t) for t in tokens]
+    tokens = [sys.executable if t in ("{python}", "$PYTHON") else t for t in tokens]
     return tokens, cmd_str
 
 
@@ -678,6 +679,7 @@ def run_verify_rules(project_root: str, rules: list[dict], fail_on_missing_tool:
                         argv,
                         shell=False,
                         cwd=rule_cwd,
+                        stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
                     )
@@ -1225,8 +1227,31 @@ def _segment_is_test_runner(seg: str) -> bool:
     return False
 
 
+READONLY_GIT_SUBCMDS = {"status", "log", "diff", "branch", "rev-parse", "show", "ls-files", "tag", "remote", "describe"}
+
+
+def _is_readonly_segment(seg: str) -> bool:
+    toks = [_strip_quotes(t) for t in _safe_split(seg, posix=False)]
+    if not toks:
+        return False
+    prog = _normalize_prog_name(toks[0])
+    if prog in READONLY_SHELL_PROGS or prog in ("cd", "set-location", "pushd", "popd"):
+        return True
+    if prog == "git":
+        args = toks[1:]
+        i = 0
+        while i < len(args) and args[i].startswith("-"):
+            if args[i] in ("-C", "-c", "--git-dir", "--work-tree") and i + 1 < len(args):
+                i += 2
+            else:
+                i += 1
+        if i < len(args) and args[i].lower() in READONLY_GIT_SUBCMDS:
+            return True
+    return False
+
+
 def _is_readonly_shell_command(cmd: str) -> bool:
-    """Return True if every segment is a pure read-only file/dir inspector with no redirections or subshells."""
+    """Return True if every segment is a pure read-only inspector (or `cd`/read-only `git`) with no redirections or subshells."""
     if not cmd or not cmd.strip():
         return False
     unquoted = _strip_quoted_strings(cmd)
@@ -1237,14 +1262,7 @@ def _is_readonly_shell_command(cmd: str) -> bool:
     segs = _split_shell_segments(cmd)
     if not segs:
         return False
-    for seg in segs:
-        toks = [_strip_quotes(t) for t in _safe_split(seg, posix=False)]
-        if not toks:
-            return False
-        prog = _normalize_prog_name(toks[0])
-        if prog not in READONLY_SHELL_PROGS:
-            return False
-    return True
+    return all(_is_readonly_segment(seg) for seg in segs)
 
 
 def is_real_test_runner_command(cmd: str) -> bool:
@@ -1543,6 +1561,48 @@ def evaluate_file_write(
     return "allow", ""
 
 
+SAFE_VERIGATE_SUBCMDS = ("status", "validate", "dispatch", "merge-check", "verify", "ci-check", "stamp-review")
+
+
+def _is_safe_chained_verigate_cmd(cmd: str) -> bool:
+    """Allow `&&`-chained safe commands with non-mutating VeriGate/bridge subcommands (never approve/waive/create)."""
+    unquoted = _strip_quoted_strings(cmd)
+    if re.search(r"[;|<>`\n]|(?<!&)&(?!&)|\$\(", unquoted):
+        return False
+    segs = _split_shell_segments(cmd)
+    if len(segs) < 2:
+        return False
+    saw_verigate = False
+    for seg in segs:
+        s = seg.strip()
+        if not s:
+            return False
+        m = SANCTIONED_GATE_CMD_RE.match(s)
+        if m:
+            if m.group(1) not in SAFE_VERIGATE_SUBCMDS:
+                return False
+            saw_verigate = True
+            continue
+        mb = SANCTIONED_BRIDGE_CMD_RE.match(s)
+        if mb:
+            if mb.group(1) not in ("detect", "preview"):
+                return False
+            saw_verigate = True
+            continue
+        if ANY_VERIGATE_INVOCATION_RE.search(s) or ANY_BRIDGE_INVOCATION_RE.search(s):
+            return False
+        if LEDGER_TAMPER_CMD_RE.search(s) or EXTERNAL_MUTATION_CMD_RE.search(s):
+            return False
+        if _is_readonly_segment(s):
+            continue
+        toks = [_strip_quotes(t) for t in _safe_split(s, posix=False)]
+        prog = _normalize_prog_name(toks[0]) if toks else ""
+        if prog == "git" and len(toks) >= 2 and toks[1].lower() in ("add", "commit"):
+            continue
+        return False
+    return saw_verigate
+
+
 def evaluate_shell_command(
     cmd: str,
     session: dict | None = None,
@@ -1560,7 +1620,7 @@ def evaluate_shell_command(
         m = SANCTIONED_GATE_CMD_RE.match(cmd)
         if m:
             subcmd = m.group(1)
-            if subcmd in ("status", "validate", "dispatch", "merge-check", "verify", "ci-check"):
+            if subcmd in SAFE_VERIGATE_SUBCMDS:
                 return "allow", ""
             if subcmd == "approve":
                 return "force_ask", "[VeriGate Approval Gate] Confirm human review of intent & spec SHA-256 digests."
@@ -1573,17 +1633,19 @@ def evaluate_shell_command(
                 return "allow", ""
             if subcmd == "create":
                 return "force_ask", "[VeriGate External Gate] Confirm creating GitHub Issues / Azure DevOps Work Items via `issue_bridge.py`."
+    elif _is_safe_chained_verigate_cmd(cmd):
+        return "allow", ""
 
     if ANY_VERIGATE_INVOCATION_RE.search(cmd):
         return (
             "deny",
-            "[VeriGate Integrity Gate] Invoking `verigate.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python3 .sdlc/bin/verigate.py <status|validate|approve|waive|dispatch|verify|ci-check>`.",
+            "[VeriGate Integrity Gate] Invoking `verigate.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python .sdlc/bin/verigate.py <status|validate|approve|waive|dispatch|verify|ci-check|stamp-review>`.",
         )
 
     if ANY_BRIDGE_INVOCATION_RE.search(cmd):
         return (
             "deny",
-            "[VeriGate Integrity Gate] Invoking `issue_bridge.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python3 .sdlc/bin/issue_bridge.py <detect|preview|create>`.",
+            "[VeriGate Integrity Gate] Invoking `issue_bridge.py` with shell chaining, redirection, or wrappers is blocked. Run standalone: `python .sdlc/bin/issue_bridge.py <detect|preview|create>`.",
         )
 
     if _is_readonly_shell_command(cmd):
@@ -1625,7 +1687,7 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
         cfg.write_text(
             json.dumps(
                 {
-                    "version": "3.0.0",
+                    "version": "3.2.0",
                     "require_spec_approval": require_spec,
                     "require_change_folder_for_gated_paths": require_spec,
                     "fail_on_missing_tool": True,
@@ -1647,6 +1709,8 @@ def cmd_init(project_root: str, require_spec: bool, change_id: str | None = None
                 {
                     "require_zero_findings": True,
                     "require_review_in_ci": True,
+                    "require_review_in_pre_push": False,
+                    "require_review_digest": True,
                     "max_open_critical": 0,
                     "max_open_high": 0,
                     "min_quality_score": 85,
@@ -1686,6 +1750,8 @@ def load_policy(project_root: str, git_ref: str | None = None) -> dict:
     policy: dict = {
         "require_zero_findings": True,
         "require_review_in_ci": True,
+        "require_review_in_pre_push": False,
+        "require_review_digest": True,
         "max_open_critical": 0,
         "max_open_high": 0,
         "min_quality_score": 85,
@@ -1776,6 +1842,28 @@ def _evaluate_merge_policy(
                 reasons.append(
                     f"Quality score {score} is below team policy minimum ({policy.get('min_quality_score', 85)})."
                 )
+
+            summary_txt = str(report.get("summary") or "").strip()
+            if len(summary_txt) < 15:
+                reasons.append(
+                    f"`{rel_dir}/review-findings.json` must include a substantive `summary` (>=15 chars); one-line stub reviews are rejected."
+                )
+
+            cfg_for_digest = load_config(project_root, git_ref=git_ref)
+            live_digest = compute_tree_digest(project_root, cfg_for_digest)
+            recorded_digest = str(report.get("reviewed_tree_digest") or "").strip()
+            if recorded_digest:
+                if recorded_digest != live_digest:
+                    reasons.append(
+                        f"Stale `{rel_dir}/review-findings.json`: gated files changed after review "
+                        f"(reviewed_tree_digest `{recorded_digest[:12]}` != current `{live_digest[:12]}`). "
+                        "Re-run Stage 5 review and `verigate.py stamp-review`."
+                    )
+            elif policy.get("require_review_digest", True):
+                reasons.append(
+                    f"Missing `reviewed_tree_digest` in `{rel_dir}/review-findings.json`. "
+                    "Run `verigate.py stamp-review` after completing Stage 5 review to bind findings to the reviewed files."
+                )
         except Exception as exc:
             reasons.append(f"Invalid `{rel_dir}/review-findings.json`: {exc}")
 
@@ -1795,6 +1883,49 @@ def _evaluate_merge_policy(
     if cid:
         out["change_id"] = cid
     return ready, out
+
+
+def cmd_stamp_review(project_root: str, change_id: str | None = None) -> int:
+    """Bind `<art_dir>/review-findings.json` to the current gated tree digest and HEAD commit."""
+    abs_root = os.path.realpath(project_root)
+    config = load_config(abs_root)
+    art_dir_str, rel_dir, cid = resolve_artifact_dir(abs_root, change_id, strict=True)
+    findings_file = Path(art_dir_str) / "review-findings.json"
+    if not findings_file.is_file():
+        print(json.dumps({"status": "error", "error": f"Missing `{rel_dir}/review-findings.json`."}))
+        return 1
+    try:
+        report = json.loads(findings_file.read_text(encoding="utf-8"))
+        if not isinstance(report, dict):
+            raise ValueError("review-findings.json must be a JSON object")
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": f"Invalid `{rel_dir}/review-findings.json`: {exc}"}))
+        return 1
+
+    tree_digest = compute_tree_digest(abs_root, config)
+    head_commit = _git_head_commit(abs_root)
+    now = utc_now_iso()
+    report["reviewed_tree_digest"] = tree_digest
+    report["reviewed_commit"] = head_commit
+    report.setdefault("reviewed_at", now)
+    tmp = f"{findings_file}.tmp"
+    Path(tmp).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, findings_file)
+    append_audit(
+        abs_root,
+        "REVIEW_STAMPED",
+        {"change_id": cid, "head_commit": head_commit, "reviewed_tree_digest": tree_digest},
+    )
+    out: dict = {
+        "status": "stamped",
+        "artifact_dir": rel_dir,
+        "reviewed_tree_digest": tree_digest,
+        "reviewed_commit": head_commit,
+    }
+    if cid:
+        out["change_id"] = cid
+    print(json.dumps(out, indent=2))
+    return 0
 
 
 def cmd_merge_check(project_root: str, change_id: str | None = None) -> int:
@@ -2295,7 +2426,7 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
         staged_rel = [_normalize_rel_path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
         ok_cf, msg_cf = check_required_change_folder(proj, staged_rel, config, change_id=change_id)
         if not ok_cf:
-            sys.stderr.write(f"\n❌ [VeriGate Change Folder Gate] {msg_cf}\n")
+            sys.stderr.write(f"\n[BLOCKED] [VeriGate Change Folder Gate] {msg_cf}\n")
             return 1
         for rel in staged_rel:
             sp = os.path.join(proj, rel)
@@ -2303,7 +2434,7 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
                 continue
             decision, reason = evaluate_file_write(sp, {}, proj, change_id=change_id)
             if decision == "deny":
-                sys.stderr.write(f"\n❌ {reason}\n")
+                sys.stderr.write(f"\n[BLOCKED] {reason}\n")
                 return 1
         return 0
 
@@ -2317,7 +2448,7 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
 
         ok_cf, msg_cf = check_required_change_folder(proj, pushed_rel, config, change_id=change_id)
         if not ok_cf:
-            sys.stderr.write(f"\n❌ [VeriGate Pre-Push Gate] {msg_cf}\n")
+            sys.stderr.write(f"\n[BLOCKED] [VeriGate Pre-Push Gate] {msg_cf}\n")
             return 1
 
         art_dir_str, rel_dir, cid = resolve_artifact_dir(proj, change_id)
@@ -2326,11 +2457,11 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
         if is_spec_lock_active(proj, {}, change_id=cid) or os.path.isfile(os.path.join(art_dir_str, "intent.md")):
             ok1, m1 = verify_stage_approval(proj, "S1_PLAN", f"{rel_dir}/intent.md", change_id=cid)
             if not ok1:
-                sys.stderr.write(f"\n❌ [VeriGate Pre-Push S1 Gate] {m1}\n")
+                sys.stderr.write(f"\n[BLOCKED] [VeriGate Pre-Push S1 Gate] {m1}\n")
                 return 1
             ok2, m2 = verify_stage_approval(proj, "S2_DESIGN", f"{rel_dir}/spec.md", change_id=cid)
             if not ok2:
-                sys.stderr.write(f"\n❌ [VeriGate Pre-Push S2 Gate] {m2}\n")
+                sys.stderr.write(f"\n[BLOCKED] [VeriGate Pre-Push S2 Gate] {m2}\n")
                 return 1
 
         if _has_valid_waiver(proj, cid, ("ALL", "S4_TEST"), gated_pushed):
@@ -2339,42 +2470,54 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
         verify_file = os.path.join(art_dir_str, "verify-result.json")
         if not os.path.isfile(verify_file):
             sys.stderr.write(
-                f"\n❌ [VeriGate Pre-Push Verify Gate] Missing `{rel_dir}/verify-result.json`. "
-                f"Run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+                f"\n[BLOCKED] [VeriGate Pre-Push Verify Gate] Missing `{rel_dir}/verify-result.json`. "
+                f"Run: `python .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
             )
             return 1
         try:
             vres = json.loads(Path(verify_file).read_text(encoding="utf-8"))
         except Exception:
             sys.stderr.write(
-                f"\n❌ [VeriGate Pre-Push Verify Gate] Corrupted `{rel_dir}/verify-result.json`. "
-                f"Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+                f"\n[BLOCKED] [VeriGate Pre-Push Verify Gate] Corrupted `{rel_dir}/verify-result.json`. "
+                f"Re-run: `python .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
             )
             return 1
 
         if not vres.get("passed"):
             sys.stderr.write(
-                f"\n❌ [VeriGate Pre-Push Verify Gate] Latest verification in `{rel_dir}/verify-result.json` did not pass. "
-                f"Fix failures and run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+                f"\n[BLOCKED] [VeriGate Pre-Push Verify Gate] Latest verification in `{rel_dir}/verify-result.json` did not pass. "
+                f"Fix failures and run: `python .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
             )
             return 1
 
         current_head = _git_head_commit(proj)
         if vres.get("head_commit") != current_head:
             sys.stderr.write(
-                f"\n❌ [VeriGate Pre-Push Verify Gate] Stale `{rel_dir}/verify-result.json` "
+                f"\n[BLOCKED] [VeriGate Pre-Push Verify Gate] Stale `{rel_dir}/verify-result.json` "
                 f"(verified `{str(vres.get('head_commit'))[:12]}`, current HEAD `{current_head[:12]}`). "
-                f"Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+                f"Re-run: `python .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
             )
             return 1
 
         current_digest = compute_tree_digest(proj, config)
         if vres.get("tree_digest") != current_digest:
             sys.stderr.write(
-                f"\n❌ [VeriGate Pre-Push Verify Gate] Gated files changed since `{rel_dir}/verify-result.json` was generated "
-                f"(digest mismatch). Re-run: `python3 .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
+                f"\n[BLOCKED] [VeriGate Pre-Push Verify Gate] Gated files changed since `{rel_dir}/verify-result.json` was generated "
+                f"(digest mismatch). Re-run: `python .sdlc/bin/verigate.py verify --project .{change_flag}`.\n"
             )
             return 1
+
+        policy = load_policy(proj)
+        findings_path = os.path.join(art_dir_str, "review-findings.json")
+        if os.path.isfile(findings_path) or policy.get("require_review_in_pre_push", False):
+            if not _has_valid_waiver(proj, cid, ("ALL", "S5_REVIEW"), gated_pushed):
+                m_ready, m_out = _evaluate_merge_policy(proj, change_id=cid, prefer_git_head=False)
+                if not m_ready:
+                    detail = "; ".join(m_out.get("blocking_reasons") or ["Review policy failed"])
+                    sys.stderr.write(
+                        f"\n[BLOCKED] [VeriGate Pre-Push Review Gate] {detail}\n"
+                    )
+                    return 1
 
         return 0
 
@@ -2445,6 +2588,9 @@ def handle_hook(adapter: str, event_override: str | None, change_id: str | None 
                 decision, reason = evaluate_shell_command(str(tinput.get("command") or ""), session, cwd, change_id=change_id)
             else:
                 decision, reason = "allow", ""
+            if decision == "allow":
+                print("{}")
+                return 0
             claude_dec = "ask" if decision in ("ask", "force_ask") else decision
             out: dict = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": claude_dec}}
             if reason:
@@ -2675,6 +2821,10 @@ def main() -> None:
     p_merge.add_argument("--project", default=".")
     p_merge.add_argument("--change", default=None)
 
+    p_stamp = sub.add_parser("stamp-review")
+    p_stamp.add_argument("--project", default=".")
+    p_stamp.add_argument("--change", default=None)
+
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--project", default=".")
     p_verify.add_argument("--change", default=None)
@@ -2730,6 +2880,8 @@ def main() -> None:
             sys.exit(0)
         if args.cmd == "merge-check":
             sys.exit(cmd_merge_check(os.path.realpath(args.project), change_id=args.change))
+        if args.cmd == "stamp-review":
+            sys.exit(cmd_stamp_review(os.path.realpath(args.project), change_id=args.change))
         if args.cmd == "verify":
             sys.exit(cmd_verify(os.path.realpath(args.project), change_id=args.change, files_arg=args.files))
         if args.cmd == "ci-check":
